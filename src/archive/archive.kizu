@@ -1,0 +1,1267 @@
+import kugi::bytes;
+import kugi::manifest;
+import kugi::posix;
+import std::array;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::mem;
+import std::path;
+import std::process;
+import std::sort;
+import std::string;
+import std::testing;
+
+pub error Error {
+    PathTraversal,
+    ArchiveInvalid,
+    BinaryNotFound,
+    IoFailed,
+    OutOfMemory,
+}
+
+pub enum ArchiveKind {
+    Tar,
+    RawBinary,
+}
+
+fn strip_url_query_fragment(url: []u8) -> []u8 {
+    var end = mem::len(url);
+    if bytes::index_of_byte(url, cast<u8>(63), 0) |q| {
+        if q < end {
+            end = q;
+        }
+    }
+    if bytes::index_of_byte(url, cast<u8>(35), 0) |h| {
+        if h < end {
+            end = h;
+        }
+    }
+    return url[0..end];
+}
+
+pub fn detect_archive_kind(url_or_path: []u8, mode: manifest::ArchiveMode) -> ArchiveKind {
+    if mode == manifest::ArchiveMode::None {
+        return ArchiveKind::RawBinary;
+    }
+    let clean = strip_url_query_fragment(url_or_path);
+    if bytes::ends_with(clean, ".tar.gz")
+        or bytes::ends_with(clean, ".tgz")
+        or bytes::ends_with(clean, ".tar.xz")
+        or bytes::ends_with(clean, ".txz")
+        or bytes::ends_with(clean, ".tar.bz2")
+        or bytes::ends_with(clean, ".tbz2")
+        or bytes::ends_with(clean, ".tar")
+        or bytes::ends_with(clean, ".zip") {
+        return ArchiveKind::Tar;
+    }
+    return ArchiveKind::RawBinary;
+}
+
+fn parent_depth(rel_entry: []u8) -> i64 {
+    let length = mem::len(rel_entry);
+    var end = length;
+    while end > 0 and rel_entry[end - 1] == cast<u8>(47) {
+        end = end - 1;
+    }
+    var segments = 0;
+    var i = 0;
+    while i < end {
+        while i < end and rel_entry[i] == cast<u8>(47) {
+            i = i + 1;
+        }
+        let start = i;
+        while i < end and rel_entry[i] != cast<u8>(47) {
+            i = i + 1;
+        }
+        if i > start {
+            let seg = rel_entry[start..i];
+            if !mem::equal_bytes(seg, ".") {
+                segments = segments + 1;
+            }
+        }
+    }
+    if segments <= 1 {
+        return 0;
+    }
+    return segments - 1;
+}
+
+fn target_stays_inside(start_depth: i64, target: []u8) -> bool {
+    let length = mem::len(target);
+    if length == 0 {
+        return false;
+    }
+    if target[0] == cast<u8>(47) {
+        return false;
+    }
+    var depth = start_depth;
+    var i = 0;
+    while i < length {
+        while i < length and target[i] == cast<u8>(47) {
+            i = i + 1;
+        }
+        let start = i;
+        while i < length and target[i] != cast<u8>(47) {
+            i = i + 1;
+        }
+        if i == start {
+            break;
+        }
+        let seg = target[start..i];
+        if mem::equal_bytes(seg, ".") {
+            continue;
+        }
+        if mem::equal_bytes(seg, "..") {
+            depth = depth - 1;
+            if depth < 0 {
+                return false;
+            }
+        } else {
+            depth = depth + 1;
+        }
+    }
+    return true;
+}
+
+fn split_lines(
+    allocator: Allocator,
+    text: []u8,
+    out: &var array::Array<string::String>,
+) -> Error!void {
+    let length = mem::len(text);
+    var start = 0;
+    while start < length {
+        var end = length;
+        if bytes::index_of_byte(text, cast<u8>(10), start) |nl| {
+            end = nl;
+        }
+        var line_end = end;
+        if line_end > start and text[line_end - 1] == cast<u8>(13) {
+            line_end = line_end - 1;
+        }
+        if line_end > start {
+            let owned = string::from_bytes(allocator, text[start..line_end]) catch return Error::OutOfMemory;
+            out.append(allocator, move owned) catch return Error::OutOfMemory;
+        }
+        if end == length {
+            break;
+        }
+        start = end + 1;
+    }
+    return;
+}
+
+pub fn validate_archive(allocator: Allocator, archive_path: []u8) -> Error!void {
+    var list_out = string::new(allocator);
+    defer list_out.deinit(allocator);
+    let rc1 = process::spawn_output8(
+        allocator,
+        &var list_out,
+        3,
+        "tar",
+        "-tf",
+        archive_path,
+        "",
+        "",
+        "",
+        "",
+        "",
+    ) catch return Error::ArchiveInvalid;
+    if rc1 != 0 {
+        return Error::ArchiveInvalid;
+    }
+    var entries = array::new<string::String>(allocator);
+    defer entries.deinit(allocator);
+    let list_bytes = list_out.as_bytes();
+    try split_lines(allocator, list_bytes, &var entries);
+
+    var i = 0;
+    while entries.at(i) |entry| {
+        let eb = entry.as_bytes();
+        if !bytes::is_safe_rel_path(eb) {
+            return Error::PathTraversal;
+        }
+        i = i + 1;
+    }
+
+    var verbose_out = string::new(allocator);
+    defer verbose_out.deinit(allocator);
+    let rc2 = process::spawn_output8(
+        allocator,
+        &var verbose_out,
+        3,
+        "tar",
+        "-tvf",
+        archive_path,
+        "",
+        "",
+        "",
+        "",
+        "",
+    ) catch return Error::ArchiveInvalid;
+    if rc2 != 0 {
+        return Error::ArchiveInvalid;
+    }
+    var vlines = array::new<string::String>(allocator);
+    defer vlines.deinit(allocator);
+    let verbose_bytes = verbose_out.as_bytes();
+    try split_lines(allocator, verbose_bytes, &var vlines);
+
+    var vi = 0;
+    while vlines.at(vi) |line| {
+        let lb = line.as_bytes();
+        let llen = mem::len(lb);
+        if llen > 0 {
+            let mode_char = lb[0];
+            if mode_char == cast<u8>(108) {
+                let arrow = bytes::find_bytes(lb, " -> ", 0) orelse return Error::PathTraversal;
+                let target = lb[arrow + 4..llen];
+                var base_depth: i64 = 0;
+                if entries.at(vi) |ep| {
+                    let epb = ep.as_bytes();
+                    base_depth = parent_depth(epb);
+                }
+                if !target_stays_inside(base_depth, target) {
+                    return Error::PathTraversal;
+                }
+            } else if mode_char == cast<u8>(104) {
+                let mark = bytes::find_bytes(lb, " link to ", 0) orelse return Error::PathTraversal;
+                let target = lb[mark + 9..llen];
+                if !target_stays_inside(0, target) {
+                    return Error::PathTraversal;
+                }
+            }
+        }
+        vi = vi + 1;
+    }
+    return;
+}
+
+fn verify_tree_symlinks(
+    handle: Io,
+    allocator: Allocator,
+    dir_path: []u8,
+    depth: i64,
+) -> Error!void {
+    var entries = fs::read_dir(handle, allocator, dir_path) catch return Error::IoFailed;
+    defer entries.deinit(allocator);
+    var i = 0;
+    while entries.at(i) |entry| {
+        let ep = entry.path.as_bytes();
+        let kind = posix::inspect_path(handle, allocator, ep) catch return Error::IoFailed;
+        if kind == posix::PathKind::Symlink {
+            var target = string::new(allocator);
+            defer target.deinit(allocator);
+            let ok = posix::read_symlink(allocator, ep, &var target) catch return Error::IoFailed;
+            if !ok {
+                return Error::PathTraversal;
+            }
+            let tb = target.as_bytes();
+            if !target_stays_inside(depth, tb) {
+                return Error::PathTraversal;
+            }
+        } else if kind == posix::PathKind::Dir {
+            try verify_tree_symlinks(handle, allocator, ep, depth + 1);
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+pub fn extract_archive(
+    handle: Io,
+    allocator: Allocator,
+    archive_path: []u8,
+    stage_dir: []u8,
+) -> Error!void {
+    try validate_archive(allocator, archive_path);
+    posix::create_dir_all(handle, allocator, stage_dir) catch return Error::IoFailed;
+    let rc = process::spawn_wait8(
+        5,
+        "tar",
+        "-xf",
+        archive_path,
+        "-C",
+        stage_dir,
+        "",
+        "",
+        "",
+    ) catch return Error::ArchiveInvalid;
+    if rc != 0 {
+        return Error::ArchiveInvalid;
+    }
+    try verify_tree_symlinks(handle, allocator, stage_dir, 0);
+    return;
+}
+
+fn path_within_real_root(root_real: []u8, resolved: []u8) -> bool {
+    let rlen = mem::len(root_real);
+    if mem::len(resolved) <= rlen {
+        return false;
+    }
+    if !mem::starts_with(resolved, root_real) {
+        return false;
+    }
+    return resolved[rlen] == cast<u8>(47);
+}
+
+fn is_valid_binary_entry(
+    handle: Io,
+    allocator: Allocator,
+    root_real: []u8,
+    candidate: []u8,
+) -> Error!bool {
+    let kind = posix::inspect_path(handle, allocator, candidate) catch return Error::IoFailed;
+    if kind != posix::PathKind::File and kind != posix::PathKind::Symlink {
+        return false;
+    }
+    var real = fs::real_path(handle, allocator, candidate) catch return false;
+    defer real.deinit(allocator);
+    let rb = real.as_bytes();
+    if !path_within_real_root(root_real, rb) {
+        return false;
+    }
+    if kind == posix::PathKind::Symlink {
+        let target_kind = posix::inspect_path(handle, allocator, rb) catch return Error::IoFailed;
+        if target_kind != posix::PathKind::File {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn resolve_real_binary(
+    handle: Io,
+    allocator: Allocator,
+    root_dir: []u8,
+    candidate: []u8,
+    out_real: &var string::String,
+) -> Error!void {
+    var root_real_str = fs::real_path(handle, allocator, root_dir) catch return Error::IoFailed;
+    defer root_real_str.deinit(allocator);
+    let root_real = root_real_str.as_bytes();
+    var real = fs::real_path(handle, allocator, candidate) catch return Error::BinaryNotFound;
+    defer real.deinit(allocator);
+    let rb = real.as_bytes();
+    if !path_within_real_root(root_real, rb) {
+        return Error::PathTraversal;
+    }
+    let kind = posix::inspect_path(handle, allocator, rb) catch return Error::IoFailed;
+    if kind != posix::PathKind::File {
+        return Error::BinaryNotFound;
+    }
+    out_real.clear();
+    out_real.append_bytes(allocator, rb) catch return Error::OutOfMemory;
+    return;
+}
+
+fn search_basename_recursive(
+    handle: Io,
+    allocator: Allocator,
+    root_real: []u8,
+    current_dir: []u8,
+    rel_prefix: []u8,
+    needle: []u8,
+    out_rel: &var string::String,
+) -> Error!bool {
+    var entries = fs::read_dir(handle, allocator, current_dir) catch return false;
+    defer entries.deinit(allocator);
+
+    var names = array::new<string::String>(allocator);
+    defer names.deinit(allocator);
+    var idx = 0;
+    while entries.at(idx) |entry| {
+        let nb = entry.name.as_bytes();
+        let copy = string::from_bytes(allocator, nb) catch return Error::OutOfMemory;
+        names.append(allocator, move copy) catch return Error::OutOfMemory;
+        idx = idx + 1;
+    }
+    sort::strings(&var names) catch return Error::IoFailed;
+
+    var i = 0;
+    while names.at(i) |name_str| {
+        let name = name_str.as_bytes();
+        if mem::equal_bytes(name, needle) {
+            var full = path::join(allocator, current_dir, name) catch return Error::OutOfMemory;
+            defer full.deinit(allocator);
+            let fb = full.as_bytes();
+            if try is_valid_binary_entry(handle, allocator, root_real, fb) {
+                if mem::len(rel_prefix) > 0 {
+                    out_rel.append_bytes(allocator, rel_prefix) catch return Error::OutOfMemory;
+                    out_rel.append_byte(allocator, cast<u8>(47)) catch return Error::OutOfMemory;
+                }
+                out_rel.append_bytes(allocator, name) catch return Error::OutOfMemory;
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+
+    var j = 0;
+    while names.at(j) |name_str| {
+        let name = name_str.as_bytes();
+        var full = path::join(allocator, current_dir, name) catch return Error::OutOfMemory;
+        defer full.deinit(allocator);
+        let fb = full.as_bytes();
+        let kind = posix::inspect_path(handle, allocator, fb) catch return Error::IoFailed;
+        if kind == posix::PathKind::Dir {
+            var next_rel = string::new(allocator);
+            defer next_rel.deinit(allocator);
+            if mem::len(rel_prefix) > 0 {
+                next_rel.append_bytes(allocator, rel_prefix) catch return Error::OutOfMemory;
+                next_rel.append_byte(allocator, cast<u8>(47)) catch return Error::OutOfMemory;
+            }
+            next_rel.append_bytes(allocator, name) catch return Error::OutOfMemory;
+            let nrb = next_rel.as_bytes();
+            if try search_basename_recursive(handle, allocator, root_real, fb, nrb, needle, out_rel) {
+                return true;
+            }
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+pub fn locate_binary(
+    handle: Io,
+    allocator: Allocator,
+    root_dir: []u8,
+    bin_source: []u8,
+    out_rel: &var string::String,
+) -> Error!void {
+    if !bytes::is_safe_rel_path(bin_source) {
+        return Error::PathTraversal;
+    }
+    var root_real_str = fs::real_path(handle, allocator, root_dir) catch return Error::IoFailed;
+    defer root_real_str.deinit(allocator);
+    let root_real = root_real_str.as_bytes();
+
+    var direct = path::join(allocator, root_dir, bin_source) catch return Error::OutOfMemory;
+    defer direct.deinit(allocator);
+    let db = direct.as_bytes();
+    if try is_valid_binary_entry(handle, allocator, root_real, db) {
+        out_rel.append_bytes(allocator, bin_source) catch return Error::OutOfMemory;
+        return;
+    }
+
+    var has_slash = false;
+    if bytes::index_of_byte(bin_source, cast<u8>(47), 0) |_| {
+        has_slash = true;
+    }
+
+    if !has_slash {
+        var direct_bin_rel = path::join(allocator, "bin", bin_source) catch return Error::OutOfMemory;
+        defer direct_bin_rel.deinit(allocator);
+        let dbr = direct_bin_rel.as_bytes();
+        var direct_bin_full = path::join(allocator, root_dir, dbr) catch return Error::OutOfMemory;
+        defer direct_bin_full.deinit(allocator);
+        let dbf = direct_bin_full.as_bytes();
+        if try is_valid_binary_entry(handle, allocator, root_real, dbf) {
+            out_rel.append_bytes(allocator, dbr) catch return Error::OutOfMemory;
+            return;
+        }
+    }
+
+    var top_entries = fs::read_dir(handle, allocator, root_dir) catch return Error::IoFailed;
+    defer top_entries.deinit(allocator);
+    if top_entries.len() == 1 {
+        if top_entries.at(0) |only| {
+            let only_path = only.path.as_bytes();
+            let only_kind = posix::inspect_path(handle, allocator, only_path) catch return Error::IoFailed;
+            if only_kind == posix::PathKind::Dir {
+                let only_name = only.name.as_bytes();
+                var nested_rel = path::join(allocator, only_name, bin_source) catch return Error::OutOfMemory;
+                defer nested_rel.deinit(allocator);
+                let nrb = nested_rel.as_bytes();
+                var nested_full = path::join(allocator, root_dir, nrb) catch return Error::OutOfMemory;
+                defer nested_full.deinit(allocator);
+                let nfb = nested_full.as_bytes();
+                if try is_valid_binary_entry(handle, allocator, root_real, nfb) {
+                    out_rel.append_bytes(allocator, nrb) catch return Error::OutOfMemory;
+                    return;
+                }
+                if !has_slash {
+                    var only_bin = path::join(allocator, only_name, "bin") catch return Error::OutOfMemory;
+                    defer only_bin.deinit(allocator);
+                    let obb = only_bin.as_bytes();
+                    var nested_bin_rel = path::join(allocator, obb, bin_source) catch return Error::OutOfMemory;
+                    defer nested_bin_rel.deinit(allocator);
+                    let nbr = nested_bin_rel.as_bytes();
+                    var nested_bin_full = path::join(allocator, root_dir, nbr) catch return Error::OutOfMemory;
+                    defer nested_bin_full.deinit(allocator);
+                    let nbf = nested_bin_full.as_bytes();
+                    if try is_valid_binary_entry(handle, allocator, root_real, nbf) {
+                        out_rel.append_bytes(allocator, nbr) catch return Error::OutOfMemory;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    if has_slash {
+        return Error::BinaryNotFound;
+    }
+    if try search_basename_recursive(handle, allocator, root_real, root_dir, "", bin_source, out_rel) {
+        return;
+    }
+    return Error::BinaryNotFound;
+}
+
+fn move_stage_to_final(
+    handle: Io,
+    allocator: Allocator,
+    raw_stage: []u8,
+    final_dir: []u8,
+    unwrap: bool,
+) -> Error!void {
+    var unwrapped = false;
+    if unwrap {
+        var top_entries = fs::read_dir(handle, allocator, raw_stage) catch return Error::IoFailed;
+        defer top_entries.deinit(allocator);
+        if top_entries.len() == 1 {
+            if top_entries.at(0) |only| {
+                let only_path = only.path.as_bytes();
+                let only_kind = posix::inspect_path(handle, allocator, only_path) catch return Error::IoFailed;
+                if only_kind == posix::PathKind::Dir {
+                    posix::rename_path(allocator, only_path, final_dir) catch return Error::IoFailed;
+                    let _ = posix::remove_tree(handle, allocator, raw_stage);
+                    unwrapped = true;
+                }
+            }
+        }
+    }
+    if !unwrapped {
+        posix::rename_path(allocator, raw_stage, final_dir) catch return Error::IoFailed;
+    } else {
+        if verify_tree_symlinks(handle, allocator, final_dir, 0) {} else |err| {
+            let _ = posix::remove_tree(handle, allocator, final_dir);
+            return err;
+        }
+    }
+    return;
+}
+
+pub fn extract_url_filename(url_hint: []u8, fallback_name: []u8) -> []u8 {
+    let clean = strip_url_query_fragment(url_hint);
+    var path_part = clean;
+    if bytes::find_bytes(clean, "://", 0) |scheme_end| {
+        if bytes::index_of_byte(clean, cast<u8>(47), scheme_end + 3) |path_start| {
+            path_part = clean[path_start..mem::len(clean)];
+        } else {
+            return fallback_name;
+        }
+    }
+    let plen = mem::len(path_part);
+    if plen == 0 or path_part[plen - 1] == cast<u8>(47) {
+        return fallback_name;
+    }
+    let base = path::basename(path_part);
+    if bytes::is_safe_name(base) {
+        return base;
+    }
+    return fallback_name;
+}
+
+pub fn stage_asset_entry(
+    handle: Io,
+    allocator: Allocator,
+    part_path: []u8,
+    url_hint: []u8,
+    asset: &manifest::AssetSpec,
+    tmp_dir: []u8,
+    nonce: []u8,
+    out_final_dir: &var string::String,
+) -> Error!void {
+    var final_dir = string::new(allocator);
+    defer final_dir.deinit(allocator);
+    final_dir.append_bytes(allocator, tmp_dir) catch return Error::OutOfMemory;
+    final_dir.append_bytes(allocator, "/final-asset-") catch return Error::OutOfMemory;
+    final_dir.append_bytes(allocator, nonce) catch return Error::OutOfMemory;
+    let fdb = final_dir.as_bytes();
+
+    let kind = detect_archive_kind(url_hint, asset.archive);
+    if kind == ArchiveKind::RawBinary {
+        posix::create_dir_all(handle, allocator, fdb) catch return Error::IoFailed;
+        let aname = asset.name.as_bytes();
+        let filename = extract_url_filename(url_hint, aname);
+        var dst = path::join(allocator, fdb, filename) catch return Error::OutOfMemory;
+        defer dst.deinit(allocator);
+        let dst_bytes = dst.as_bytes();
+        if posix::copy_file_streaming(allocator, part_path, dst_bytes) {} else |_| {
+            let _ = posix::remove_tree(handle, allocator, fdb);
+            return Error::IoFailed;
+        }
+        out_final_dir.append_bytes(allocator, fdb) catch return Error::OutOfMemory;
+        return;
+    }
+
+    var raw_stage = string::new(allocator);
+    defer raw_stage.deinit(allocator);
+    raw_stage.append_bytes(allocator, tmp_dir) catch return Error::OutOfMemory;
+    raw_stage.append_bytes(allocator, "/stage-asset-") catch return Error::OutOfMemory;
+    raw_stage.append_bytes(allocator, nonce) catch return Error::OutOfMemory;
+    let rsb = raw_stage.as_bytes();
+
+    if extract_archive(handle, allocator, part_path, rsb) {} else |err| {
+        let _ = posix::remove_tree(handle, allocator, rsb);
+        return err;
+    }
+
+    if move_stage_to_final(handle, allocator, rsb, fdb, asset.unwrap) {} else |err| {
+        let _ = posix::remove_tree(handle, allocator, rsb);
+        let _ = posix::remove_tree(handle, allocator, fdb);
+        return err;
+    }
+
+    out_final_dir.append_bytes(allocator, fdb) catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn stage_store_entry(
+    handle: Io,
+    allocator: Allocator,
+    part_path: []u8,
+    url_hint: []u8,
+    tool: &manifest::ToolSpec,
+    tmp_dir: []u8,
+    nonce: []u8,
+    out_final_dir: &var string::String,
+) -> Error!void {
+    var final_dir = string::new(allocator);
+    defer final_dir.deinit(allocator);
+    final_dir.append_bytes(allocator, tmp_dir) catch return Error::OutOfMemory;
+    final_dir.append_bytes(allocator, "/final-") catch return Error::OutOfMemory;
+    final_dir.append_bytes(allocator, nonce) catch return Error::OutOfMemory;
+    let fdb = final_dir.as_bytes();
+
+    var final_bin = path::join(allocator, fdb, "bin") catch return Error::OutOfMemory;
+    defer final_bin.deinit(allocator);
+    let fbb = final_bin.as_bytes();
+
+    let kind = detect_archive_kind(url_hint, tool.archive);
+    if kind == ArchiveKind::RawBinary {
+        posix::create_dir_all(handle, allocator, fbb) catch return Error::IoFailed;
+        var bi = 0;
+        while tool.bins.at(bi) |bspec| {
+            let dest_name = bspec.dest.as_bytes();
+            var dst = path::join(allocator, fbb, dest_name) catch return Error::OutOfMemory;
+            defer dst.deinit(allocator);
+            let dst_bytes = dst.as_bytes();
+            if posix::copy_file_streaming(allocator, part_path, dst_bytes) {} else |_| {
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return Error::IoFailed;
+            }
+            if posix::set_executable(allocator, dst_bytes) {} else |_| {
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return Error::IoFailed;
+            }
+            bi = bi + 1;
+        }
+        out_final_dir.append_bytes(allocator, fdb) catch return Error::OutOfMemory;
+        return;
+    }
+
+    var raw_stage = string::new(allocator);
+    defer raw_stage.deinit(allocator);
+    raw_stage.append_bytes(allocator, tmp_dir) catch return Error::OutOfMemory;
+    raw_stage.append_bytes(allocator, "/stage-") catch return Error::OutOfMemory;
+    raw_stage.append_bytes(allocator, nonce) catch return Error::OutOfMemory;
+    let rsb = raw_stage.as_bytes();
+
+    if extract_archive(handle, allocator, part_path, rsb) {} else |err| {
+        let _ = posix::remove_tree(handle, allocator, rsb);
+        return err;
+    }
+
+    if tool.extract == manifest::ExtractMode::Bin {
+        if posix::create_dir_all(handle, allocator, fbb) {} else |_| {
+            let _ = posix::remove_tree(handle, allocator, rsb);
+            return Error::IoFailed;
+        }
+        var bi = 0;
+        while tool.bins.at(bi) |bspec| {
+            let src_spec = bspec.source.as_bytes();
+            let dest_name = bspec.dest.as_bytes();
+            var rel = string::new(allocator);
+            defer rel.deinit(allocator);
+            if locate_binary(handle, allocator, rsb, src_spec, &var rel) {} else |err| {
+                let _ = posix::remove_tree(handle, allocator, rsb);
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return err;
+            }
+            let rel_b = rel.as_bytes();
+            var src_full = path::join(allocator, rsb, rel_b) catch return Error::OutOfMemory;
+            defer src_full.deinit(allocator);
+            let sfb = src_full.as_bytes();
+            var src_real = string::new(allocator);
+            defer src_real.deinit(allocator);
+            if resolve_real_binary(handle, allocator, rsb, sfb, &var src_real) {} else |err| {
+                let _ = posix::remove_tree(handle, allocator, rsb);
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return err;
+            }
+            var dst_full = path::join(allocator, fbb, dest_name) catch return Error::OutOfMemory;
+            defer dst_full.deinit(allocator);
+            let srb = src_real.as_bytes();
+            let dfb = dst_full.as_bytes();
+            if posix::copy_file_streaming(allocator, srb, dfb) {} else |_| {
+                let _ = posix::remove_tree(handle, allocator, rsb);
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return Error::IoFailed;
+            }
+            if posix::set_executable(allocator, dfb) {} else |_| {
+                let _ = posix::remove_tree(handle, allocator, rsb);
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return Error::IoFailed;
+            }
+            bi = bi + 1;
+        }
+        let _ = posix::remove_tree(handle, allocator, rsb);
+        out_final_dir.append_bytes(allocator, fdb) catch return Error::OutOfMemory;
+        return;
+    }
+
+    if move_stage_to_final(handle, allocator, rsb, fdb, true) {} else |err| {
+        let _ = posix::remove_tree(handle, allocator, rsb);
+        let _ = posix::remove_tree(handle, allocator, fdb);
+        return err;
+    }
+    let bin_kind = posix::inspect_path(handle, allocator, fbb) catch return Error::IoFailed;
+    if bin_kind == posix::PathKind::File or bin_kind == posix::PathKind::Symlink {
+        let _ = posix::remove_tree(handle, allocator, fdb);
+        return Error::ArchiveInvalid;
+    }
+    if posix::create_dir_all(handle, allocator, fbb) {} else |_| {
+        let _ = posix::remove_tree(handle, allocator, fdb);
+        return Error::IoFailed;
+    }
+    var bi = 0;
+    while tool.bins.at(bi) |bspec| {
+        let src_spec = bspec.source.as_bytes();
+        let dest_name = bspec.dest.as_bytes();
+        var rel = string::new(allocator);
+        defer rel.deinit(allocator);
+        if locate_binary(handle, allocator, fdb, src_spec, &var rel) {} else |err| {
+            let _ = posix::remove_tree(handle, allocator, fdb);
+            return err;
+        }
+        let rel_b = rel.as_bytes();
+        var target_abs = path::join(allocator, fdb, rel_b) catch return Error::OutOfMemory;
+        defer target_abs.deinit(allocator);
+        let tab = target_abs.as_bytes();
+        var target_real = string::new(allocator);
+        defer target_real.deinit(allocator);
+        if resolve_real_binary(handle, allocator, fdb, tab, &var target_real) {} else |err| {
+            let _ = posix::remove_tree(handle, allocator, fdb);
+            return err;
+        }
+        let trb = target_real.as_bytes();
+        if posix::set_executable(allocator, trb) {} else |_| {
+            let _ = posix::remove_tree(handle, allocator, fdb);
+            return Error::IoFailed;
+        }
+        var expected_bin_rel = string::new(allocator);
+        defer expected_bin_rel.deinit(allocator);
+        expected_bin_rel.append_bytes(allocator, "bin/") catch return Error::OutOfMemory;
+        expected_bin_rel.append_bytes(allocator, dest_name) catch return Error::OutOfMemory;
+        let ebr = expected_bin_rel.as_bytes();
+        var preserve_existing = mem::equal_bytes(rel_b, ebr);
+        if !preserve_existing {
+            var existing_bin = path::join(allocator, fbb, dest_name) catch return Error::OutOfMemory;
+            defer existing_bin.deinit(allocator);
+            let ebb = existing_bin.as_bytes();
+            var existing_real = string::new(allocator);
+            defer existing_real.deinit(allocator);
+            if resolve_real_binary(handle, allocator, fdb, ebb, &var existing_real) {
+                let erb = existing_real.as_bytes();
+                if mem::equal_bytes(erb, trb) {
+                    preserve_existing = true;
+                }
+            } else |_| {}
+        }
+        if !preserve_existing {
+            var link_target = string::new(allocator);
+            defer link_target.deinit(allocator);
+            if mem::starts_with(rel_b, "bin/") {
+                link_target.append_bytes(allocator, rel_b[4..mem::len(rel_b)]) catch return Error::OutOfMemory;
+            } else {
+                link_target.append_bytes(allocator, "../") catch return Error::OutOfMemory;
+                link_target.append_bytes(allocator, rel_b) catch return Error::OutOfMemory;
+            }
+            var link_path = path::join(allocator, fbb, dest_name) catch return Error::OutOfMemory;
+            defer link_path.deinit(allocator);
+            let ltb = link_target.as_bytes();
+            let lpb = link_path.as_bytes();
+            if posix::atomic_symlink(allocator, ltb, lpb, nonce) {} else |_| {
+                let _ = posix::remove_tree(handle, allocator, fdb);
+                return Error::IoFailed;
+            }
+        }
+        bi = bi + 1;
+    }
+    out_final_dir.append_bytes(allocator, fdb) catch return Error::OutOfMemory;
+    return;
+}
+
+test "archive kind detection and link depth safety" {
+    testing::expect(detect_archive_kind("https://example.com/a.tar.gz?token=1", manifest::ArchiveMode::Auto) == ArchiveKind::Tar);
+    testing::expect(detect_archive_kind("https://example.com/a.zip", manifest::ArchiveMode::Auto) == ArchiveKind::Tar);
+    testing::expect(detect_archive_kind("https://example.com/a.tar.gz", manifest::ArchiveMode::None) == ArchiveKind::RawBinary);
+    testing::expect(detect_archive_kind("https://example.com/mytool", manifest::ArchiveMode::Auto) == ArchiveKind::RawBinary);
+
+    testing::expect(target_stays_inside(1, "bin/rg"));
+    testing::expect(target_stays_inside(1, "../bin/rg"));
+    testing::expect(!target_stays_inside(1, "../../etc/passwd"));
+    testing::expect(!target_stays_inside(0, "../outside"));
+    testing::expect(!target_stays_inside(2, "/etc/passwd"));
+}
+
+test "archive extraction rejects traversal and strips bins" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-arch-test-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+
+    if posix::create_dir_all(handle, allocator, base_bytes) {} else |_| {
+        testing::fail("create base failed");
+        return;
+    }
+
+    let py_code =
+        \\import io, os, sys, tarfile
+        \\base = sys.argv[1]
+        \\with tarfile.open(os.path.join(base, "good.tar.gz"), "w:gz") as tf:
+        \\    for name, body in [("pkg-1.0/mybin", b"#!/bin/sh\necho ok\n"), ("pkg-1.0/lib/data.txt", b"sibling"), ("pkg-1.0/README.md", b"unused")]:
+        \\        ti = tarfile.TarInfo(name)
+        \\        ti.size = len(body)
+        \\        ti.mode = 0o755
+        \\        tf.addfile(ti, io.BytesIO(body))
+        \\with tarfile.open(os.path.join(base, "dotdot.tar.gz"), "w:gz") as tf:
+        \\    ti = tarfile.TarInfo("../escape.txt")
+        \\    ti.size = 3
+        \\    tf.addfile(ti, io.BytesIO(b"bad"))
+        \\with tarfile.open(os.path.join(base, "symlink_escape.tar.gz"), "w:gz") as tf:
+        \\    ti = tarfile.TarInfo("pkg/badlink")
+        \\    ti.type = tarfile.SYMTYPE
+        \\    ti.linkname = "../../etc/passwd"
+        \\    tf.addfile(ti)
+    ;
+    let rc = process::spawn_wait8(
+        4,
+        "python3",
+        "-c",
+        py_code,
+        base_bytes,
+        "",
+        "",
+        "",
+        "",
+    ) catch -1;
+    testing::expect_equal<i64>(0, rc);
+
+    var dotdot = path::join(allocator, base_bytes, "dotdot.tar.gz") catch return;
+    defer dotdot.deinit(allocator);
+    let ddb = dotdot.as_bytes();
+    if validate_archive(allocator, ddb) {
+        testing::fail("dotdot archive should be rejected");
+    } else |_| {}
+
+    var symesc = path::join(allocator, base_bytes, "symlink_escape.tar.gz") catch return;
+    defer symesc.deinit(allocator);
+    let seb = symesc.as_bytes();
+    if validate_archive(allocator, seb) {
+        testing::fail("symlink escape archive should be rejected");
+    } else |_| {}
+
+    var good = path::join(allocator, base_bytes, "good.tar.gz") catch return;
+    defer good.deinit(allocator);
+    let gb = good.as_bytes();
+
+    let mdoc =
+        \\[tools.demo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/good.tar.gz"
+        \\bin = ["mybin"]
+        \\
+        \\[tools.full]
+        \\version = "1.0.0"
+        \\url = "https://example.com/good.tar.gz"
+        \\extract = "all"
+        \\bin = ["mybin"]
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, mdoc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.tools.at(0) |t_bin| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_store_entry(handle, allocator, gb, "good.tar.gz", t_bin, base_bytes, "1", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var bin_file = path::join(allocator, odb, "bin/mybin") catch return;
+                defer bin_file.deinit(allocator);
+                let bfb = bin_file.as_bytes();
+                if posix::inspect_path(handle, allocator, bfb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("inspect bin failed");
+                }
+                var readme = path::join(allocator, odb, "pkg-1.0/README.md") catch return;
+                defer readme.deinit(allocator);
+                let rmb = readme.as_bytes();
+                if posix::inspect_path(handle, allocator, rmb) |k| {
+                    testing::expect(k == posix::PathKind::Missing);
+                } else |_| {
+                    testing::fail("inspect readme failed");
+                }
+            } else |_| {
+                testing::fail("stage bin failed");
+            }
+        }
+        if m.tools.at(1) |t_all| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_store_entry(handle, allocator, gb, "good.tar.gz", t_all, base_bytes, "2", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var bin_link = path::join(allocator, odb, "bin/mybin") catch return;
+                defer bin_link.deinit(allocator);
+                let blb = bin_link.as_bytes();
+                if posix::inspect_path(handle, allocator, blb) |k| {
+                    testing::expect(k == posix::PathKind::Symlink);
+                } else |_| {
+                    testing::fail("inspect all bin symlink failed");
+                }
+                var lib_file = path::join(allocator, odb, "lib/data.txt") catch return;
+                defer lib_file.deinit(allocator);
+                let lfb = lib_file.as_bytes();
+                if posix::inspect_path(handle, allocator, lfb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("inspect unwrapped sibling lib file failed");
+                }
+                var wrapped_dir = path::join(allocator, odb, "pkg-1.0") catch return;
+                defer wrapped_dir.deinit(allocator);
+                let wdb = wrapped_dir.as_bytes();
+                if posix::inspect_path(handle, allocator, wdb) |k| {
+                    testing::expect(k == posix::PathKind::Missing);
+                } else |_| {
+                    testing::fail("inspect wrapped dir failed");
+                }
+            } else |_| {
+                testing::fail("stage all failed");
+            }
+        }
+    } else |_| {
+        testing::fail("manifest parse failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}
+
+test "archive extract all unwrap and symlink binaries" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-arch-sym-test-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+
+    if posix::create_dir_all(handle, allocator, base_bytes) {} else |_| {
+        testing::fail("create base failed");
+        return;
+    }
+
+    let py_code =
+        \\import io, os, sys, tarfile
+        \\base = sys.argv[1]
+        \\with tarfile.open(os.path.join(base, "nodelike.tar.gz"), "w:gz") as tf:
+        \\    files = [
+        \\        ("node-v24/bin/node", b"#!/bin/sh\necho node-ok\n", 0o755),
+        \\        ("node-v24/lib/node_modules/npm/bin/npm-cli.js", b"#!/bin/sh\necho npm-real\n", 0o644),
+        \\        ("node-v24/lib/node_modules/npm/bin/npm", b"#!/bin/sh\necho decoy\n", 0o755),
+        \\        ("node-v24/lib/data.txt", b"payload\n", 0o644),
+        \\    ]
+        \\    for name, body, mode in files:
+        \\        ti = tarfile.TarInfo(name)
+        \\        ti.size = len(body)
+        \\        ti.mode = mode
+        \\        tf.addfile(ti, io.BytesIO(body))
+        \\    for name, target in [
+        \\        ("node-v24/bin/npm", "../lib/node_modules/npm/bin/npm-cli.js"),
+        \\        ("node-v24/bin/dirlink", "../lib"),
+        \\        ("node-v24/bin/dangling", "../lib/missing.js"),
+        \\    ]:
+        \\        ti = tarfile.TarInfo(name)
+        \\        ti.type = tarfile.SYMTYPE
+        \\        ti.linkname = target
+        \\        tf.addfile(ti)
+        \\with tarfile.open(os.path.join(base, "unwrap_escape.tar.gz"), "w:gz") as tf:
+        \\    ti = tarfile.TarInfo("pkg-1.0/tool")
+        \\    ti.size = 4
+        \\    ti.mode = 0o755
+        \\    tf.addfile(ti, io.BytesIO(b"bin\n"))
+        \\    ti = tarfile.TarInfo("pkg-1.0/badlink")
+        \\    ti.type = tarfile.SYMTYPE
+        \\    ti.linkname = "../outside"
+        \\    tf.addfile(ti)
+    ;
+    let rc = process::spawn_wait8(
+        4,
+        "python3",
+        "-c",
+        py_code,
+        base_bytes,
+        "",
+        "",
+        "",
+        "",
+    ) catch -1;
+    testing::expect_equal<i64>(0, rc);
+
+    var nodelike = path::join(allocator, base_bytes, "nodelike.tar.gz") catch return;
+    defer nodelike.deinit(allocator);
+    let nlb = nodelike.as_bytes();
+
+    var escape_tar = path::join(allocator, base_bytes, "unwrap_escape.tar.gz") catch return;
+    defer escape_tar.deinit(allocator);
+    let etb = escape_tar.as_bytes();
+
+    let mdoc =
+        \\[tools.node_all]
+        \\version = "24.0.0"
+        \\url = "https://example.com/nodelike.tar.gz"
+        \\extract = "all"
+        \\bin = ["node", "npm"]
+        \\
+        \\[tools.npm_bin]
+        \\version = "24.0.0"
+        \\url = "https://example.com/nodelike.tar.gz"
+        \\extract = "bin"
+        \\bin = ["npm"]
+        \\
+        \\[tools.esc_all]
+        \\version = "1.0.0"
+        \\url = "https://example.com/unwrap_escape.tar.gz"
+        \\extract = "all"
+        \\bin = ["tool"]
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, mdoc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.tools.at(0) |t_all| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_store_entry(handle, allocator, nlb, "nodelike.tar.gz", t_all, base_bytes, "10", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var wrapped = path::join(allocator, odb, "node-v24") catch return;
+                defer wrapped.deinit(allocator);
+                let wb = wrapped.as_bytes();
+                if posix::inspect_path(handle, allocator, wb) |k| {
+                    testing::expect(k == posix::PathKind::Missing);
+                } else |_| {
+                    testing::fail("wrapper dir should be unwrapped");
+                }
+
+                var npm_path = path::join(allocator, odb, "bin/npm") catch return;
+                defer npm_path.deinit(allocator);
+                let npb = npm_path.as_bytes();
+                if posix::inspect_path(handle, allocator, npb) |k| {
+                    testing::expect(k == posix::PathKind::Symlink);
+                } else |_| {
+                    testing::fail("inspect bin/npm failed");
+                }
+                var link_target = string::new(allocator);
+                defer link_target.deinit(allocator);
+                if posix::read_symlink(allocator, npb, &var link_target) |ok| {
+                    testing::expect(ok);
+                    let ltb = link_target.as_bytes();
+                    testing::expect_equal<[]u8>("../lib/node_modules/npm/bin/npm-cli.js", ltb);
+                } else |_| {
+                    testing::fail("read_symlink bin/npm failed");
+                }
+
+                var bad_rel = string::new(allocator);
+                defer bad_rel.deinit(allocator);
+                if locate_binary(handle, allocator, odb, "dirlink", &var bad_rel) {
+                    testing::fail("symlink to directory must not be located as binary");
+                } else |_| {}
+                bad_rel.clear();
+                if locate_binary(handle, allocator, odb, "dangling", &var bad_rel) {
+                    testing::fail("dangling symlink must not be located as binary");
+                } else |_| {}
+            } else |_| {
+                testing::fail("stage nodelike all failed");
+            }
+        }
+        if m.tools.at(1) |t_bin| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_store_entry(handle, allocator, nlb, "nodelike.tar.gz", t_bin, base_bytes, "11", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var npm_path = path::join(allocator, odb, "bin/npm") catch return;
+                defer npm_path.deinit(allocator);
+                let npb = npm_path.as_bytes();
+                if posix::inspect_path(handle, allocator, npb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("extract=bin symlink target should become regular file");
+                }
+                if fs::read_file(handle, allocator, npb, mem::Limit::Bytes(1024)) |content| {
+                    defer content.deinit(allocator);
+                    let cb = content.as_bytes();
+                    testing::expect(bytes::contains_bytes(cb, "npm-real"));
+                } else |_| {
+                    testing::fail("read copied symlink binary failed");
+                }
+            } else |_| {
+                testing::fail("stage nodelike bin failed");
+            }
+        }
+        if m.tools.at(2) |t_esc| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_store_entry(handle, allocator, etb, "unwrap_escape.tar.gz", t_esc, base_bytes, "12", &var out_dir) {
+                testing::fail("symlink escaping after unwrap must be rejected");
+            } else |_| {}
+        }
+    } else |_| {
+        testing::fail("manifest parse failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}
+
+test "asset staging single file unwrap true and unwrap false" {
+    testing::expect_equal<[]u8>("font.ttf", extract_url_filename("https://example.com/a/font.ttf?v=1#top", "fallback"));
+    testing::expect_equal<[]u8>("fallback", extract_url_filename("https://example.com/", "fallback"));
+    testing::expect_equal<[]u8>("fallback", extract_url_filename("https://example.com", "fallback"));
+
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-asset-stage-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+    if posix::create_dir_all(handle, allocator, base_bytes) {} else |_| {
+        testing::fail("create base failed");
+        return;
+    }
+
+    let py_code =
+        \\import io, os, sys, tarfile
+        \\base = sys.argv[1]
+        \\with tarfile.open(os.path.join(base, "pack.tar.gz"), "w:gz") as tf:
+        \\    for name, body in [("pack-1.0/data/dict.txt", b"hello\n"), ("pack-1.0/META", b"v1\n")]:
+        \\        ti = tarfile.TarInfo(name)
+        \\        ti.size = len(body)
+        \\        ti.mode = 0o644
+        \\        tf.addfile(ti, io.BytesIO(body))
+        \\with open(os.path.join(base, "single.dat"), "wb") as f:
+        \\    f.write(b"raw-asset-bytes")
+    ;
+    let rc = process::spawn_wait8(4, "python3", "-c", py_code, base_bytes, "", "", "", "") catch -1;
+    testing::expect_equal<i64>(0, rc);
+
+    var pack_path = path::join(allocator, base_bytes, "pack.tar.gz") catch return;
+    defer pack_path.deinit(allocator);
+    let ppb = pack_path.as_bytes();
+    var single_path = path::join(allocator, base_bytes, "single.dat") catch return;
+    defer single_path.deinit(allocator);
+    let spb = single_path.as_bytes();
+
+    let mdoc =
+        \\[assets.unwrapped]
+        \\version = "1.0.0"
+        \\url = "https://example.com/pack.tar.gz"
+        \\
+        \\[assets.wrapped]
+        \\version = "1.0.0"
+        \\url = "https://example.com/pack.tar.gz"
+        \\unwrap = false
+        \\
+        \\[assets.single]
+        \\version = "1.0.0"
+        \\url = "https://example.com/files/custom.dat?dl=1"
+        \\archive = "none"
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, mdoc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.assets.at(0) |a_unw| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_asset_entry(handle, allocator, ppb, "https://example.com/pack.tar.gz", a_unw, base_bytes, "1", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var dict_file = path::join(allocator, odb, "data/dict.txt") catch return;
+                defer dict_file.deinit(allocator);
+                let dfb = dict_file.as_bytes();
+                if posix::inspect_path(handle, allocator, dfb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("unwrapped data/dict.txt missing");
+                }
+            } else |_| {
+                testing::fail("stage unwrapped asset failed");
+            }
+        }
+        if m.assets.at(1) |a_wrap| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_asset_entry(handle, allocator, ppb, "https://example.com/pack.tar.gz", a_wrap, base_bytes, "2", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var nested_file = path::join(allocator, odb, "pack-1.0/data/dict.txt") catch return;
+                defer nested_file.deinit(allocator);
+                let nfb = nested_file.as_bytes();
+                if posix::inspect_path(handle, allocator, nfb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("unwrap=false must keep top-level dir");
+                }
+            } else |_| {
+                testing::fail("stage wrapped asset failed");
+            }
+        }
+        if m.assets.at(2) |a_single| {
+            var out_dir = string::new(allocator);
+            defer out_dir.deinit(allocator);
+            if stage_asset_entry(handle, allocator, spb, "https://example.com/files/custom.dat?dl=1", a_single, base_bytes, "3", &var out_dir) {
+                let odb = out_dir.as_bytes();
+                var file_path = path::join(allocator, odb, "custom.dat") catch return;
+                defer file_path.deinit(allocator);
+                let fpb = file_path.as_bytes();
+                if posix::inspect_path(handle, allocator, fpb) |k| {
+                    testing::expect(k == posix::PathKind::File);
+                } else |_| {
+                    testing::fail("single-file asset missing");
+                }
+            } else |_| {
+                testing::fail("stage single-file asset failed");
+            }
+        }
+    } else |_| {
+        testing::fail("manifest parse failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}

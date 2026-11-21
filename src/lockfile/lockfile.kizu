@@ -1,0 +1,549 @@
+import kugi::bytes;
+import std::array;
+import std::json;
+import std::map;
+import std::mem;
+import std::sort;
+import std::string;
+import std::testing;
+
+pub error Error {
+    InvalidJson,
+    UnsupportedVersion,
+    InvalidEntry,
+    OutOfMemory,
+}
+
+pub struct TargetLock {
+    pub url: string::String,
+    pub sha256: string::String,
+}
+
+pub fn (self: TargetLock) deinit(allocator: Allocator) -> void {
+    self.url.deinit(allocator);
+    self.sha256.deinit(allocator);
+    return;
+}
+
+pub struct ToolLock {
+    pub version: string::String,
+    pub targets: map::Map<[]u8, TargetLock>,
+}
+
+pub fn (self: ToolLock) deinit(allocator: Allocator) -> void {
+    self.version.deinit(allocator);
+    self.targets.deinit(allocator);
+    return;
+}
+
+pub struct Lockfile {
+    pub version: i64,
+    pub tools: map::Map<[]u8, ToolLock>,
+    pub assets: map::Map<[]u8, ToolLock>,
+}
+
+pub fn (self: Lockfile) deinit(allocator: Allocator) -> void {
+    self.tools.deinit(allocator);
+    self.assets.deinit(allocator);
+    return;
+}
+
+struct WireLockfile {
+    pub version: i64,
+    pub tools: ?map::Map<[]u8, ToolLock>,
+    pub assets: ?map::Map<[]u8, ToolLock>,
+}
+
+fn (self: WireLockfile) deinit(allocator: Allocator) -> void {
+    if self.tools |t| {
+        t.deinit(allocator);
+    }
+    if self.assets |a| {
+        a.deinit(allocator);
+    }
+    return;
+}
+
+pub fn new_lockfile(allocator: Allocator) -> Lockfile {
+    return Lockfile {
+        version: 1,
+        tools: map::new<[]u8, ToolLock>(allocator),
+        assets: map::new<[]u8, ToolLock>(allocator),
+    };
+}
+
+fn copy_and_validate_map(
+    allocator: Allocator,
+    src: &map::Map<[]u8, ToolLock>,
+    dst: &var map::Map<[]u8, ToolLock>,
+) -> Error!void {
+    var i = 0;
+    while src.key_at(i) |item_name| {
+        if src.at(item_name) |tlock| {
+            if tlock.version.len() == 0 {
+                return Error::InvalidEntry;
+            }
+            let ver_b = tlock.version.as_bytes();
+            var owned_ver = string::from_bytes(allocator, ver_b) catch return Error::OutOfMemory;
+            errdefer owned_ver.deinit(allocator);
+            var targets = map::new<[]u8, TargetLock>(allocator);
+            errdefer targets.deinit(allocator);
+            var j = 0;
+            while tlock.targets.key_at(j) |target_name| {
+                if tlock.targets.at(target_name) |entry| {
+                    if entry.url.len() == 0 {
+                        return Error::InvalidEntry;
+                    }
+                    let hash = entry.sha256.as_bytes();
+                    if !bytes::is_valid_sha256_hex(hash) {
+                        return Error::InvalidEntry;
+                    }
+                    let ub = entry.url.as_bytes();
+                    var owned_url = string::from_bytes(allocator, ub) catch return Error::OutOfMemory;
+                    errdefer owned_url.deinit(allocator);
+                    var owned_sha = string::from_bytes(allocator, hash) catch return Error::OutOfMemory;
+                    errdefer owned_sha.deinit(allocator);
+                    let target_copy = TargetLock {
+                        url: move owned_url,
+                        sha256: move owned_sha,
+                    };
+                    targets.insert(allocator, target_name, move target_copy) catch return Error::OutOfMemory;
+                }
+                j = j + 1;
+            }
+            let lock_copy = ToolLock {
+                version: move owned_ver,
+                targets: move targets,
+            };
+            dst.insert(allocator, item_name, move lock_copy) catch return Error::OutOfMemory;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+pub fn decode(allocator: Allocator, raw: []u8) -> Error!Lockfile {
+    var wire = json::decode<WireLockfile>(allocator, raw) catch return Error::InvalidJson;
+    defer wire.deinit(allocator);
+    if wire.version != 1 {
+        return Error::UnsupportedVersion;
+    }
+    var has_any = false;
+    var lf = new_lockfile(allocator);
+    errdefer lf.deinit(allocator);
+    if wire.tools |tools_map| {
+        has_any = true;
+        try copy_and_validate_map(allocator, &tools_map, &var lf.tools);
+    }
+    if wire.assets |assets_map| {
+        has_any = true;
+        try copy_and_validate_map(allocator, &assets_map, &var lf.assets);
+    }
+    if !has_any {
+        return Error::InvalidJson;
+    }
+    return move lf;
+}
+
+fn set_map_target(
+    allocator: Allocator,
+    entries: &var map::Map<[]u8, ToolLock>,
+    item_name: []u8,
+    version: []u8,
+    target_key: []u8,
+    url: []u8,
+    sha256: []u8,
+) -> Error!void {
+    if !bytes::is_valid_sha256_hex(sha256) or mem::len(url) == 0 or mem::len(version) == 0 {
+        return Error::InvalidEntry;
+    }
+    var owned_url = string::from_bytes(allocator, url) catch return Error::OutOfMemory;
+    errdefer owned_url.deinit(allocator);
+    var owned_sha = string::from_bytes(allocator, sha256) catch return Error::OutOfMemory;
+    errdefer owned_sha.deinit(allocator);
+    let target_entry = TargetLock {
+        url: move owned_url,
+        sha256: move owned_sha,
+    };
+
+    var replace_item = false;
+    if entries.at(item_name) |existing| {
+        let ev = existing.version.as_bytes();
+        if !mem::equal_bytes(ev, version) {
+            replace_item = true;
+        }
+    } else {
+        replace_item = true;
+    }
+
+    if replace_item {
+        if entries.remove(allocator, item_name) |old| {
+            old.deinit(allocator);
+        }
+        errdefer target_entry.deinit(allocator);
+        var owned_ver = string::from_bytes(allocator, version) catch return Error::OutOfMemory;
+        errdefer owned_ver.deinit(allocator);
+        var targets = map::new<[]u8, TargetLock>(allocator);
+        errdefer targets.deinit(allocator);
+        targets.insert(allocator, target_key, move target_entry) catch return Error::OutOfMemory;
+        let tlock = ToolLock {
+            version: move owned_ver,
+            targets: move targets,
+        };
+        entries.insert(allocator, item_name, move tlock) catch return Error::OutOfMemory;
+        return;
+    }
+
+    if entries.at_mut(item_name) |existing| {
+        if existing.targets.remove(allocator, target_key) |old_target| {
+            old_target.deinit(allocator);
+        }
+        existing.targets.insert(allocator, target_key, move target_entry) catch return Error::OutOfMemory;
+        return;
+    }
+    target_entry.deinit(allocator);
+    return Error::InvalidEntry;
+}
+
+pub fn set_target(
+    allocator: Allocator,
+    lf: &var Lockfile,
+    tool_name: []u8,
+    version: []u8,
+    target_key: []u8,
+    url: []u8,
+    sha256: []u8,
+) -> Error!void {
+    return set_map_target(allocator, &var lf.tools, tool_name, version, target_key, url, sha256);
+}
+
+pub fn set_asset_target(
+    allocator: Allocator,
+    lf: &var Lockfile,
+    asset_name: []u8,
+    version: []u8,
+    target_key: []u8,
+    url: []u8,
+    sha256: []u8,
+) -> Error!void {
+    return set_map_target(allocator, &var lf.assets, asset_name, version, target_key, url, sha256);
+}
+
+fn encode_lock_map(
+    allocator: Allocator,
+    enc: &var json::Encoder,
+    field_name: []u8,
+    entries: &map::Map<[]u8, ToolLock>,
+) -> Error!void {
+    var item_names = array::new<string::String>(allocator);
+    defer item_names.deinit(allocator);
+    var i = 0;
+    while entries.key_at(i) |k| {
+        let owned = string::from_bytes(allocator, k) catch return Error::OutOfMemory;
+        item_names.append(allocator, move owned) catch return Error::OutOfMemory;
+        i = i + 1;
+    }
+    sort::strings(&var item_names) catch return Error::InvalidEntry;
+
+    enc.begin_object_field(field_name) catch return Error::OutOfMemory;
+
+    var ti = 0;
+    while item_names.at(ti) |name_str| {
+        let name = name_str.as_bytes();
+        if entries.at(name) |tlock| {
+            enc.begin_object_field(name) catch return Error::OutOfMemory;
+            let ver = tlock.version.as_bytes();
+            enc.write_bytes_field("version", ver) catch return Error::OutOfMemory;
+            enc.begin_object_field("targets") catch return Error::OutOfMemory;
+
+            var target_keys = array::new<string::String>(allocator);
+            defer target_keys.deinit(allocator);
+            var j = 0;
+            while tlock.targets.key_at(j) |tk| {
+                let owned_tk = string::from_bytes(allocator, tk) catch return Error::OutOfMemory;
+                target_keys.append(allocator, move owned_tk) catch return Error::OutOfMemory;
+                j = j + 1;
+            }
+            sort::strings(&var target_keys) catch return Error::InvalidEntry;
+
+            var ki = 0;
+            while target_keys.at(ki) |tk_str| {
+                let tk = tk_str.as_bytes();
+                if tlock.targets.at(tk) |entry| {
+                    enc.begin_object_field(tk) catch return Error::OutOfMemory;
+                    let url_b = entry.url.as_bytes();
+                    let sha_b = entry.sha256.as_bytes();
+                    enc.write_bytes_field("url", url_b) catch return Error::OutOfMemory;
+                    enc.write_bytes_field("sha256", sha_b) catch return Error::OutOfMemory;
+                    enc.end_object() catch return Error::OutOfMemory;
+                }
+                ki = ki + 1;
+            }
+
+            enc.end_object() catch return Error::OutOfMemory;
+            enc.end_object() catch return Error::OutOfMemory;
+        }
+        ti = ti + 1;
+    }
+
+    enc.end_object() catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn encode(
+    allocator: Allocator,
+    lf: &Lockfile,
+    out: &var string::String,
+) -> Error!void {
+    var enc = json::encoder_with_spaces(allocator, 2);
+    defer enc.deinit(allocator);
+    enc.begin_object() catch return Error::OutOfMemory;
+    enc.write_i64_field("version", lf.version) catch return Error::OutOfMemory;
+    try encode_lock_map(allocator, &var enc, "tools", &lf.tools);
+    if lf.assets.len() > 0 {
+        try encode_lock_map(allocator, &var enc, "assets", &lf.assets);
+    }
+    enc.end_object() catch return Error::OutOfMemory;
+    enc.finish_into(allocator, out) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
+    return;
+}
+
+fn lookup_map_target(
+    allocator: Allocator,
+    entries: &map::Map<[]u8, ToolLock>,
+    item_name: []u8,
+    expected_version: []u8,
+    target_key: []u8,
+    out_url: &var string::String,
+    out_sha: &var string::String,
+) -> mem::Error!bool {
+    if entries.at(item_name) |tlock| {
+        let lv = tlock.version.as_bytes();
+        if !mem::equal_bytes(lv, expected_version) {
+            return false;
+        }
+        if tlock.targets.at(target_key) |entry| {
+            let ub = entry.url.as_bytes();
+            let sb = entry.sha256.as_bytes();
+            out_url.clear();
+            out_sha.clear();
+            try out_url.append_bytes(allocator, ub);
+            try out_sha.append_bytes(allocator, sb);
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn lookup_target(
+    allocator: Allocator,
+    lf: &Lockfile,
+    tool_name: []u8,
+    expected_version: []u8,
+    target_key: []u8,
+    out_url: &var string::String,
+    out_sha: &var string::String,
+) -> mem::Error!bool {
+    return lookup_map_target(allocator, &lf.tools, tool_name, expected_version, target_key, out_url, out_sha);
+}
+
+pub fn lookup_asset_target(
+    allocator: Allocator,
+    lf: &Lockfile,
+    asset_name: []u8,
+    expected_version: []u8,
+    target_key: []u8,
+    out_url: &var string::String,
+    out_sha: &var string::String,
+) -> mem::Error!bool {
+    return lookup_map_target(allocator, &lf.assets, asset_name, expected_version, target_key, out_url, out_sha);
+}
+
+test "lockfile encode sort and roundtrip" {
+    let allocator = mem::page_allocator();
+    var lf = new_lockfile(allocator);
+    defer lf.deinit(allocator);
+
+    let h1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let h2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let h3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    if set_target(allocator, &var lf, "zig", "0.16.0", "linux-x86_64", "https://example.com/zig-linux", h2) {} else |_| {
+        testing::fail("set_target zig linux failed");
+        return;
+    }
+    if set_target(allocator, &var lf, "zig", "0.16.0", "darwin-aarch64", "https://example.com/zig-darwin", h3) {} else |_| {
+        testing::fail("set_target zig darwin failed");
+        return;
+    }
+    if set_target(allocator, &var lf, "ripgrep", "14.1.1", "darwin-aarch64", "https://example.com/rg", h1) {} else |_| {
+        testing::fail("set_target rg failed");
+        return;
+    }
+
+    var encoded = string::new(allocator);
+    defer encoded.deinit(allocator);
+    if encode(allocator, &lf, &var encoded) {} else |_| {
+        testing::fail("encode failed");
+        return;
+    }
+    let text = encoded.as_bytes();
+
+    let rg_pos = bytes::find_bytes(text, "ripgrep", 0) orelse -1;
+    let zig_pos = bytes::find_bytes(text, "zig", 0) orelse -1;
+    testing::expect(rg_pos >= 0 and zig_pos > rg_pos);
+
+    let darwin_pos = bytes::find_bytes(text, "darwin-aarch64", zig_pos) orelse -1;
+    let linux_pos = bytes::find_bytes(text, "linux-x86_64", zig_pos) orelse -1;
+    testing::expect(darwin_pos >= 0 and linux_pos > darwin_pos);
+
+    if decode(allocator, text) |decoded| {
+        defer decoded.deinit(allocator);
+
+        var u = string::new(allocator);
+        defer u.deinit(allocator);
+        var s = string::new(allocator);
+        defer s.deinit(allocator);
+        if lookup_target(allocator, &decoded, "ripgrep", "14.1.1", "darwin-aarch64", &var u, &var s) |found| {
+            testing::expect(found);
+            let ub = u.as_bytes();
+            let sb = s.as_bytes();
+            testing::expect_equal<[]u8>("https://example.com/rg", ub);
+            testing::expect_equal<[]u8>(h1, sb);
+        } else |_| {
+            testing::fail("lookup failed");
+        }
+
+        if lookup_target(allocator, &decoded, "ripgrep", "15.0.0", "darwin-aarch64", &var u, &var s) |wrong_ver| {
+            testing::expect(!wrong_ver);
+        } else |_| {
+            testing::fail("lookup failed");
+        }
+    } else |_| {
+        testing::fail("decode roundtrip failed");
+    }
+
+    if set_target(allocator, &var lf, "zig", "0.17.0", "darwin-aarch64", "https://example.com/zig-017", h1) {
+        if lf.tools.at("zig") |zt| {
+            testing::expect_equal<i64>(1, zt.targets.len());
+        } else {
+            testing::fail("zig missing after version update");
+        }
+    } else |_| {
+        testing::fail("version bump set_target failed");
+    }
+
+    let bad_ver =
+        \\{"version": 2, "tools": {}}
+    ;
+    if decode(allocator, bad_ver) |bad| {
+        bad.deinit(allocator);
+        testing::fail("lockfile version 2 should be rejected");
+    } else |_| {}
+}
+
+test "lockfile assets roundtrip backward compatibility and multi-target merge" {
+    let allocator = mem::page_allocator();
+    let h1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let h2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let h3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    let legacy_json =
+        \\{"version": 1, "tools": {"rg": {"version": "14.1.1", "targets": {"linux-aarch64": {"url": "https://example.com/rg-la", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}
+    ;
+    if decode(allocator, legacy_json) |legacy| {
+        var lf = move legacy;
+        defer lf.deinit(allocator);
+        testing::expect_equal<i64>(0, lf.assets.len());
+
+        var no_assets_out = string::new(allocator);
+        defer no_assets_out.deinit(allocator);
+        if encode(allocator, &lf, &var no_assets_out) {
+            let nab = no_assets_out.as_bytes();
+            let assets_key =
+                \\"assets"
+            ;
+            testing::expect(!bytes::contains_bytes(nab, assets_key));
+        } else |_| {
+            testing::fail("encode without assets failed");
+        }
+
+        if set_target(allocator, &var lf, "rg", "14.1.1", "darwin-aarch64", "https://example.com/rg-da", h2) {} else |_| {
+            testing::fail("merge tool target failed");
+            return;
+        }
+        if set_asset_target(allocator, &var lf, "fonts", "1.0.0", "linux-x86_64", "https://example.com/fonts-lx.tar.gz", h2) {} else |_| {
+            testing::fail("set_asset_target linux failed");
+            return;
+        }
+        if set_asset_target(allocator, &var lf, "fonts", "1.0.0", "darwin-aarch64", "https://example.com/fonts-da.tar.gz", h3) {} else |_| {
+            testing::fail("set_asset_target darwin failed");
+            return;
+        }
+        if set_asset_target(allocator, &var lf, "dict", "2.0.0", "darwin-aarch64", "https://example.com/dict.dat", h1) {} else |_| {
+            testing::fail("set_asset_target dict failed");
+            return;
+        }
+
+        var encoded = string::new(allocator);
+        defer encoded.deinit(allocator);
+        if encode(allocator, &lf, &var encoded) {} else |_| {
+            testing::fail("encode with assets failed");
+            return;
+        }
+        let text = encoded.as_bytes();
+        let dict_key =
+            \\"dict"
+        ;
+        let fonts_key =
+            \\"fonts"
+        ;
+        let dict_pos = bytes::find_bytes(text, dict_key, 0) orelse -1;
+        let fonts_pos = bytes::find_bytes(text, fonts_key, 0) orelse -1;
+        testing::expect(dict_pos >= 0 and fonts_pos > dict_pos);
+
+        if decode(allocator, text) |round| {
+            defer round.deinit(allocator);
+            var u = string::new(allocator);
+            defer u.deinit(allocator);
+            var s = string::new(allocator);
+            defer s.deinit(allocator);
+
+            if lookup_target(allocator, &round, "rg", "14.1.1", "linux-aarch64", &var u, &var s) |ok| {
+                testing::expect(ok);
+                let sb = s.as_bytes();
+                testing::expect_equal<[]u8>(h1, sb);
+            } else |_| {
+                testing::fail("preserved tool target lookup failed");
+            }
+            if lookup_target(allocator, &round, "rg", "14.1.1", "darwin-aarch64", &var u, &var s) |ok| {
+                testing::expect(ok);
+                let sb = s.as_bytes();
+                testing::expect_equal<[]u8>(h2, sb);
+            } else |_| {
+                testing::fail("merged tool target lookup failed");
+            }
+            if lookup_asset_target(allocator, &round, "fonts", "1.0.0", "darwin-aarch64", &var u, &var s) |ok| {
+                testing::expect(ok);
+                let ub = u.as_bytes();
+                let sb = s.as_bytes();
+                testing::expect_equal<[]u8>("https://example.com/fonts-da.tar.gz", ub);
+                testing::expect_equal<[]u8>(h3, sb);
+            } else |_| {
+                testing::fail("asset darwin lookup failed");
+            }
+            if lookup_asset_target(allocator, &round, "fonts", "1.0.0", "linux-x86_64", &var u, &var s) |ok| {
+                testing::expect(ok);
+                let sb = s.as_bytes();
+                testing::expect_equal<[]u8>(h2, sb);
+            } else |_| {
+                testing::fail("asset linux lookup failed");
+            }
+        } else |_| {
+            testing::fail("roundtrip decode with assets failed");
+        }
+    } else |_| {
+        testing::fail("decode legacy lockfile failed");
+    }
+}

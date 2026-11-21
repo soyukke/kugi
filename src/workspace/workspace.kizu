@@ -1,0 +1,1573 @@
+import kugi::bytes;
+import kugi::fetch;
+import kugi::hash;
+import kugi::lockfile;
+import kugi::manifest;
+import kugi::posix;
+import kugi::roots;
+import kugi::store;
+import std::array;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::mem;
+import std::path;
+import std::process;
+import std::sort;
+import std::string;
+import std::testing;
+
+pub error Error {
+    ManifestNotFound,
+    ManifestInvalid,
+    UsageError,
+    Unlocked,
+    HashMismatch,
+    LinkConflict,
+    DownloadFailed,
+    StoreFailed,
+    IoFailed,
+    OutOfMemory,
+}
+
+fn set_msg(allocator: Allocator, diag: &var string::String, msg: []u8) -> void {
+    diag.clear();
+    diag.append_bytes(allocator, msg) catch return;
+    return;
+}
+
+fn fail_msg(allocator: Allocator, diag: &var string::String, err: Error, msg: []u8) -> Error {
+    set_msg(allocator, diag, msg);
+    return err;
+}
+
+fn unlock_err(guard: &var posix::FileLock, err: Error) -> Error {
+    posix::release_lock(guard);
+    return err;
+}
+
+fn unlink_err(allocator: Allocator, part_path: []u8, err: Error) -> Error {
+    let _ = posix::unlink_if_exists(allocator, part_path);
+    return err;
+}
+
+fn unlock_unlink_err(
+    allocator: Allocator,
+    guard: &var posix::FileLock,
+    part_path: []u8,
+    err: Error,
+) -> Error {
+    let _ = posix::unlink_if_exists(allocator, part_path);
+    posix::release_lock(guard);
+    return err;
+}
+
+fn canonical_or_clean(
+    handle: Io,
+    allocator: Allocator,
+    raw_path: []u8,
+    out: &var string::String,
+) -> Error!void {
+    if fs::real_path(handle, allocator, raw_path) |rp| {
+        defer rp.deinit(allocator);
+        let rpb = rp.as_bytes();
+        out.append_bytes(allocator, rpb) catch return Error::OutOfMemory;
+        return;
+    } else |_| {}
+    let cleaned = path::clean(allocator, raw_path) catch return Error::OutOfMemory;
+    defer cleaned.deinit(allocator);
+    let cb = cleaned.as_bytes();
+    out.append_bytes(allocator, cb) catch return Error::OutOfMemory;
+    return;
+}
+
+fn make_absolute_from_cwd(
+    allocator: Allocator,
+    raw_path: []u8,
+    out: &var string::String,
+) -> Error!void {
+    if mem::len(raw_path) > 0 and raw_path[0] == cast<u8>(47) {
+        let cleaned = path::clean(allocator, raw_path) catch return Error::OutOfMemory;
+        defer cleaned.deinit(allocator);
+        let cb = cleaned.as_bytes();
+        out.append_bytes(allocator, cb) catch return Error::OutOfMemory;
+        return;
+    }
+    var cwd = string::new(allocator);
+    defer cwd.deinit(allocator);
+    posix::get_cwd(allocator, &var cwd) catch return Error::IoFailed;
+    let cwdb = cwd.as_bytes();
+    let joined = path::join(allocator, cwdb, raw_path) catch return Error::OutOfMemory;
+    defer joined.deinit(allocator);
+    let jb = joined.as_bytes();
+    out.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn resolve_manifest_path(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    explicit_manifest: []u8,
+    out_path: &var string::String,
+    out_is_global: &var bool,
+    diag: &var string::String,
+) -> Error!void {
+    out_is_global.* = false;
+    var candidate = string::new(allocator);
+    defer candidate.deinit(allocator);
+
+    if mem::len(explicit_manifest) > 0 {
+        var expanded = string::new(allocator);
+        defer expanded.deinit(allocator);
+        let home_b = paths.home_dir.as_bytes();
+        bytes::expand_tilde(allocator, explicit_manifest, home_b, &var expanded) catch return Error::OutOfMemory;
+        let eb = expanded.as_bytes();
+        try make_absolute_from_cwd(allocator, eb, &var candidate);
+        let cb = candidate.as_bytes();
+        let kind = posix::inspect_path(handle, allocator, cb) catch return Error::IoFailed;
+        if kind == posix::PathKind::Missing or kind == posix::PathKind::Dir {
+            set_msg(allocator, diag, "manifest file not found");
+            return Error::ManifestNotFound;
+        }
+    } else {
+        var dir = string::new(allocator);
+        defer dir.deinit(allocator);
+        posix::get_cwd(allocator, &var dir) catch return Error::IoFailed;
+        var found = false;
+        while true {
+            let db = dir.as_bytes();
+            var probe = path::join(allocator, db, "kugi.toml") catch return Error::OutOfMemory;
+            defer probe.deinit(allocator);
+            let pb = probe.as_bytes();
+            let kind = posix::inspect_path(handle, allocator, pb) catch return Error::IoFailed;
+            if kind == posix::PathKind::File or kind == posix::PathKind::Symlink {
+                candidate.append_bytes(allocator, pb) catch return Error::OutOfMemory;
+                found = true;
+                break;
+            }
+            let parent = path::dirname(db);
+            if mem::len(parent) == 0 or mem::equal_bytes(parent, db) {
+                break;
+            }
+            var next_dir = string::from_bytes(allocator, parent) catch return Error::OutOfMemory;
+            defer next_dir.deinit(allocator);
+            let ndb = next_dir.as_bytes();
+            dir.clear();
+            dir.append_bytes(allocator, ndb) catch return Error::OutOfMemory;
+        }
+        if !found {
+            let gm = paths.global_manifest.as_bytes();
+            if mem::len(gm) == 0 {
+                set_msg(allocator, diag, "no kugi.toml found in current directory tree or global config");
+                return Error::ManifestNotFound;
+            }
+            let kind = posix::inspect_path(handle, allocator, gm) catch return Error::IoFailed;
+            if kind == posix::PathKind::Missing or kind == posix::PathKind::Dir {
+                set_msg(allocator, diag, "no kugi.toml found in current directory tree or global config");
+                return Error::ManifestNotFound;
+            }
+            candidate.append_bytes(allocator, gm) catch return Error::OutOfMemory;
+        }
+    }
+
+    let cand_b = candidate.as_bytes();
+    var canon_cand = string::new(allocator);
+    defer canon_cand.deinit(allocator);
+    try canonical_or_clean(handle, allocator, cand_b, &var canon_cand);
+    let ccb = canon_cand.as_bytes();
+    out_path.clear();
+    out_path.append_bytes(allocator, ccb) catch return Error::OutOfMemory;
+
+    let gm_b = paths.global_manifest.as_bytes();
+    if mem::len(gm_b) > 0 {
+        var canon_gm = string::new(allocator);
+        defer canon_gm.deinit(allocator);
+        try canonical_or_clean(handle, allocator, gm_b, &var canon_gm);
+        let cgmb = canon_gm.as_bytes();
+        out_is_global.* = mem::equal_bytes(ccb, cgmb);
+    }
+    return;
+}
+
+pub fn sibling_lockfile_path(
+    allocator: Allocator,
+    manifest_path: []u8,
+    out_lock_path: &var string::String,
+) -> Error!void {
+    let dir = path::dirname(manifest_path);
+    var joined = path::join(allocator, dir, "kugi.lock") catch return Error::OutOfMemory;
+    defer joined.deinit(allocator);
+    let jb = joined.as_bytes();
+    out_lock_path.clear();
+    out_lock_path.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn load_manifest_file(
+    handle: Io,
+    allocator: Allocator,
+    manifest_path: []u8,
+    diag: &var string::String,
+) -> Error!manifest::Manifest {
+    var raw = fs::read_file(handle, allocator, manifest_path, mem::Limit::Bytes(4194304)) catch return fail_msg(allocator, diag, Error::ManifestNotFound, "failed to read manifest file");
+    defer raw.deinit(allocator);
+    let rb = raw.as_bytes();
+    let parsed = manifest::parse(allocator, rb, diag) catch return Error::ManifestInvalid;
+    return move parsed;
+}
+
+pub fn load_lockfile_optional(
+    handle: Io,
+    allocator: Allocator,
+    lock_path: []u8,
+    out_exists: &var bool,
+    diag: &var string::String,
+) -> Error!lockfile::Lockfile {
+    let kind = posix::inspect_path(handle, allocator, lock_path) catch return Error::IoFailed;
+    if kind == posix::PathKind::Missing {
+        out_exists.* = false;
+        return lockfile::new_lockfile(allocator);
+    }
+    out_exists.* = true;
+    var raw = fs::read_file(handle, allocator, lock_path, mem::Limit::Bytes(16777216)) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to read kugi.lock");
+    defer raw.deinit(allocator);
+    let rb = raw.as_bytes();
+    let lf = lockfile::decode(allocator, rb) catch return fail_msg(allocator, diag, Error::ManifestInvalid, "invalid kugi.lock JSON");
+    return move lf;
+}
+
+fn strings_equal(a: &string::String, b: &string::String) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    return mem::equal_bytes(ab, bb);
+}
+
+pub fn resolve_tool_lock(
+    allocator: Allocator,
+    tool: &manifest::ToolSpec,
+    lf: &lockfile::Lockfile,
+    os: []u8,
+    arch: []u8,
+    out_url: &var string::String,
+    out_sha: &var string::String,
+) -> Error!bool {
+    out_url.clear();
+    out_sha.clear();
+    if tool.has_sha256 {
+        manifest::resolve_tool_url(allocator, tool, os, arch, out_url) catch return Error::OutOfMemory;
+        let sb = tool.sha256.as_bytes();
+        out_sha.append_bytes(allocator, sb) catch return Error::OutOfMemory;
+        return true;
+    }
+    var target_key = string::new(allocator);
+    defer target_key.deinit(allocator);
+    target_key.append_bytes(allocator, os) catch return Error::OutOfMemory;
+    target_key.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
+    target_key.append_bytes(allocator, arch) catch return Error::OutOfMemory;
+    let tkb = target_key.as_bytes();
+    let tname = tool.name.as_bytes();
+    let tver = tool.version.as_bytes();
+    let matched = lockfile::lookup_target(allocator, lf, tname, tver, tkb, out_url, out_sha) catch return Error::OutOfMemory;
+    if !matched {
+        return false;
+    }
+    var expected_url = string::new(allocator);
+    defer expected_url.deinit(allocator);
+    manifest::resolve_tool_url(allocator, tool, os, arch, &var expected_url) catch return Error::OutOfMemory;
+    if !strings_equal(&expected_url, out_url) {
+        out_url.clear();
+        out_sha.clear();
+        return false;
+    }
+    return true;
+}
+
+pub fn resolve_asset_lock(
+    allocator: Allocator,
+    asset: &manifest::AssetSpec,
+    lf: &lockfile::Lockfile,
+    os: []u8,
+    arch: []u8,
+    out_url: &var string::String,
+    out_sha: &var string::String,
+) -> Error!bool {
+    out_url.clear();
+    out_sha.clear();
+    if asset.has_sha256 {
+        manifest::resolve_asset_url(allocator, asset, os, arch, out_url) catch return Error::OutOfMemory;
+        let sb = asset.sha256.as_bytes();
+        out_sha.append_bytes(allocator, sb) catch return Error::OutOfMemory;
+        return true;
+    }
+    var target_key = string::new(allocator);
+    defer target_key.deinit(allocator);
+    target_key.append_bytes(allocator, os) catch return Error::OutOfMemory;
+    target_key.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
+    target_key.append_bytes(allocator, arch) catch return Error::OutOfMemory;
+    let tkb = target_key.as_bytes();
+    let aname = asset.name.as_bytes();
+    let aver = asset.version.as_bytes();
+    let matched = lockfile::lookup_asset_target(allocator, lf, aname, aver, tkb, out_url, out_sha) catch return Error::OutOfMemory;
+    if !matched {
+        return false;
+    }
+    var expected_url = string::new(allocator);
+    defer expected_url.deinit(allocator);
+    manifest::resolve_asset_url(allocator, asset, os, arch, &var expected_url) catch return Error::OutOfMemory;
+    if !strings_equal(&expected_url, out_url) {
+        out_url.clear();
+        out_sha.clear();
+        return false;
+    }
+    return true;
+}
+
+pub fn resolve_user_path(
+    allocator: Allocator,
+    raw: []u8,
+    home_dir: []u8,
+    base_dir: []u8,
+    out: &var string::String,
+) -> Error!void {
+    var expanded = string::new(allocator);
+    defer expanded.deinit(allocator);
+    bytes::expand_tilde(allocator, raw, home_dir, &var expanded) catch return Error::OutOfMemory;
+    let eb = expanded.as_bytes();
+    if mem::len(eb) > 0 and eb[0] == cast<u8>(47) {
+        let cleaned = path::clean(allocator, eb) catch return Error::OutOfMemory;
+        defer cleaned.deinit(allocator);
+        let cb = cleaned.as_bytes();
+        out.append_bytes(allocator, cb) catch return Error::OutOfMemory;
+        return;
+    }
+    let joined = path::join(allocator, base_dir, eb) catch return Error::OutOfMemory;
+    defer joined.deinit(allocator);
+    let jb = joined.as_bytes();
+    out.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn apply_links(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    m: &manifest::Manifest,
+    manifest_dir: []u8,
+    force: bool,
+    diag: &var string::String,
+) -> Error!void {
+    var dest_keys = array::new<string::String>(allocator);
+    defer dest_keys.deinit(allocator);
+    var ki = 0;
+    while m.links.key_at(ki) |k| {
+        let owned = string::from_bytes(allocator, k) catch return Error::OutOfMemory;
+        dest_keys.append(allocator, move owned) catch return Error::OutOfMemory;
+        ki = ki + 1;
+    }
+    sort::strings(&var dest_keys) catch return Error::IoFailed;
+
+    let home_b = paths.home_dir.as_bytes();
+    var idx = 0;
+    while dest_keys.at(idx) |dest_raw_str| {
+        let dest_raw = dest_raw_str.as_bytes();
+        if m.links.at(dest_raw) |src_raw_str| {
+            let src_raw = src_raw_str.as_bytes();
+            var dest_abs = string::new(allocator);
+            defer dest_abs.deinit(allocator);
+            try resolve_user_path(allocator, dest_raw, home_b, manifest_dir, &var dest_abs);
+
+            var src_abs = string::new(allocator);
+            defer src_abs.deinit(allocator);
+            try resolve_user_path(allocator, src_raw, home_b, manifest_dir, &var src_abs);
+
+            let dab = dest_abs.as_bytes();
+            let sab = src_abs.as_bytes();
+            let parent = path::dirname(dab);
+            if mem::len(parent) > 0 and !mem::equal_bytes(parent, ".") {
+                posix::create_dir_all(handle, allocator, parent) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create parent directory for link");
+            }
+
+            let kind = posix::inspect_path(handle, allocator, dab) catch return Error::IoFailed;
+            if kind == posix::PathKind::Symlink {
+                var current_target = string::new(allocator);
+                defer current_target.deinit(allocator);
+                let _ = posix::read_symlink(allocator, dab, &var current_target) catch return Error::IoFailed;
+                let ctb = current_target.as_bytes();
+                if mem::equal_bytes(ctb, sab) {
+                    idx = idx + 1;
+                    continue;
+                }
+                var nonce = string::new(allocator);
+                defer nonce.deinit(allocator);
+                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
+                let nb = nonce.as_bytes();
+                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to update symlink");
+            } else if kind == posix::PathKind::Missing {
+                var nonce = string::new(allocator);
+                defer nonce.deinit(allocator);
+                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
+                let nb = nonce.as_bytes();
+                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create symlink");
+            } else {
+                if !force {
+                    diag.clear();
+                    diag.append_bytes(allocator, "refusing to overwrite non-symlink path '") catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, dab) catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, "' (re-run with --force to replace)") catch return Error::OutOfMemory;
+                    return Error::LinkConflict;
+                }
+                if kind == posix::PathKind::Dir {
+                    posix::remove_tree(handle, allocator, dab) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to remove directory under --force");
+                }
+                var nonce = string::new(allocator);
+                defer nonce.deinit(allocator);
+                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
+                let nb = nonce.as_bytes();
+                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to replace path with symlink");
+            }
+        }
+        idx = idx + 1;
+    }
+    return;
+}
+
+fn update_global_bin_links(
+    allocator: Allocator,
+    paths: &store::Paths,
+    tool: &manifest::ToolSpec,
+    store_key: []u8,
+    seq: i64,
+) -> Error!void {
+    let sd = paths.store_dir.as_bytes();
+    let bd = paths.bin_dir.as_bytes();
+    var entry_bin = string::new(allocator);
+    defer entry_bin.deinit(allocator);
+    entry_bin.append_bytes(allocator, sd) catch return Error::OutOfMemory;
+    entry_bin.append_byte(allocator, cast<u8>(47)) catch return Error::OutOfMemory;
+    entry_bin.append_bytes(allocator, store_key) catch return Error::OutOfMemory;
+    entry_bin.append_bytes(allocator, "/bin") catch return Error::OutOfMemory;
+    let ebb = entry_bin.as_bytes();
+
+    var bi = 0;
+    while tool.bins.at(bi) |bspec| {
+        let dest = bspec.dest.as_bytes();
+        var target = path::join(allocator, ebb, dest) catch return Error::OutOfMemory;
+        defer target.deinit(allocator);
+        var linkpath = path::join(allocator, bd, dest) catch return Error::OutOfMemory;
+        defer linkpath.deinit(allocator);
+        var nonce = string::new(allocator);
+        defer nonce.deinit(allocator);
+        store::make_nonce(allocator, seq * 100 + bi, &var nonce) catch return Error::OutOfMemory;
+        let tb = target.as_bytes();
+        let lb = linkpath.as_bytes();
+        let nb = nonce.as_bytes();
+        posix::atomic_symlink(allocator, tb, lb, nb) catch return Error::IoFailed;
+        bi = bi + 1;
+    }
+    return;
+}
+
+fn format_download_error(
+    allocator: Allocator,
+    diag: &var string::String,
+    tool_name: []u8,
+    url: []u8,
+    err: fetch::Error,
+    status: i64,
+) -> void {
+    diag.clear();
+    diag.append_bytes(allocator, "failed to download '") catch return;
+    diag.append_bytes(allocator, tool_name) catch return;
+    diag.append_bytes(allocator, "' from ") catch return;
+    diag.append_bytes(allocator, url) catch return;
+    diag.append_bytes(allocator, ": ") catch return;
+    fetch::format_error_reason(allocator, err, status, diag);
+    return;
+}
+
+fn publish_locked_part(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    tool: &manifest::ToolSpec,
+    manifest_dir: []u8,
+    url_b: []u8,
+    sha_b: []u8,
+    part_b: []u8,
+    seq: i64,
+    diag: &var string::String,
+) -> Error!void {
+    let tname = tool.name.as_bytes();
+    let tver = tool.version.as_bytes();
+    let sd = paths.store_dir.as_bytes();
+    let ld = paths.locks_dir.as_bytes();
+    let home_b = paths.home_dir.as_bytes();
+
+    if tool.has_sha256 {
+        let inline_sha = tool.sha256.as_bytes();
+        if !hash::equal_digest(sha_b, inline_sha) {
+            let _ = posix::unlink_if_exists(allocator, part_b);
+            diag.clear();
+            diag.append_bytes(allocator, "sha256 mismatch for '") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "': expected ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, inline_sha) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, ", got ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+            return Error::HashMismatch;
+        }
+    }
+
+    if tool.mode == manifest::InstallMode::Bootstrap {
+        var install_dir = string::new(allocator);
+        defer install_dir.deinit(allocator);
+        let raw_dir = tool.install_dir.as_bytes();
+        if resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var install_dir) {} else |err| {
+            return unlink_err(allocator, part_b, err);
+        }
+        let idb = install_dir.as_bytes();
+        let already = store::bootstrap_all_present(handle, allocator, idb, tool) catch return unlink_err(allocator, part_b, Error::StoreFailed);
+        if already {
+            let _ = posix::unlink_if_exists(allocator, part_b);
+            return;
+        }
+        var lock_name = string::new(allocator);
+        defer lock_name.deinit(allocator);
+        lock_name.append_bytes(allocator, "bootstrap-") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+        lock_name.append_bytes(allocator, tname) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+        lock_name.append_bytes(allocator, ".lock") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+        let lnb = lock_name.as_bytes();
+        var lock_file = path::join(allocator, ld, lnb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+        defer lock_file.deinit(allocator);
+        let lfb = lock_file.as_bytes();
+
+        var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return unlink_err(allocator, part_b, Error::IoFailed);
+        let still_present = store::bootstrap_all_present(handle, allocator, idb, tool) catch return unlock_unlink_err(allocator, &var guard, part_b, Error::StoreFailed);
+        if still_present {
+            let _ = posix::unlink_if_exists(allocator, part_b);
+            posix::release_lock(&var guard);
+            return;
+        }
+        var actual_sha = string::new(allocator);
+        defer actual_sha.deinit(allocator);
+        if store::install_bootstrap_file(handle, allocator, paths, tool, url_b, sha_b, part_b, idb, seq, &var actual_sha) {} else |err| {
+            posix::release_lock(&var guard);
+            if err == store::Error::HashMismatch {
+                set_msg(allocator, diag, "sha256 mismatch during bootstrap install");
+                return Error::HashMismatch;
+            }
+            set_msg(allocator, diag, "failed to extract or install bootstrap tool");
+            return Error::StoreFailed;
+        }
+        posix::release_lock(&var guard);
+        return;
+    }
+
+    var key = string::new(allocator);
+    defer key.deinit(allocator);
+    store::format_store_key(allocator, tname, tver, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    let kb = key.as_bytes();
+
+    var entry_dir = path::join(allocator, sd, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    defer entry_dir.deinit(allocator);
+    let edb = entry_dir.as_bytes();
+
+    var lock_name = string::new(allocator);
+    defer lock_name.deinit(allocator);
+    lock_name.append_bytes(allocator, "store-") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    lock_name.append_bytes(allocator, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    lock_name.append_bytes(allocator, ".lock") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    let lnb = lock_name.as_bytes();
+    var lock_file = path::join(allocator, ld, lnb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    defer lock_file.deinit(allocator);
+    let lfb = lock_file.as_bytes();
+
+    var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return unlink_err(allocator, part_b, Error::IoFailed);
+    let existing = posix::inspect_path(handle, allocator, edb) catch return unlock_unlink_err(allocator, &var guard, part_b, Error::IoFailed);
+    if existing == posix::PathKind::Dir {
+        posix::touch_now(allocator, edb);
+        let _ = posix::unlink_if_exists(allocator, part_b);
+        posix::release_lock(&var guard);
+        return;
+    }
+    var actual_sha = string::new(allocator);
+    defer actual_sha.deinit(allocator);
+    if store::publish_verified_file(handle, allocator, paths, tool, url_b, sha_b, part_b, seq, &var actual_sha) {} else |err| {
+        posix::release_lock(&var guard);
+        if err == store::Error::HashMismatch {
+            set_msg(allocator, diag, "sha256 mismatch during publish");
+            return Error::HashMismatch;
+        }
+        set_msg(allocator, diag, "failed to extract or publish tool into store");
+        return Error::StoreFailed;
+    }
+    posix::release_lock(&var guard);
+    return;
+}
+
+fn publish_locked_asset_part(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    asset: &manifest::AssetSpec,
+    url_b: []u8,
+    sha_b: []u8,
+    part_b: []u8,
+    seq: i64,
+    diag: &var string::String,
+) -> Error!void {
+    let aname = asset.name.as_bytes();
+    let aver = asset.version.as_bytes();
+    let sd = paths.store_dir.as_bytes();
+    let ld = paths.locks_dir.as_bytes();
+
+    if asset.has_sha256 {
+        let inline_sha = asset.sha256.as_bytes();
+        if !hash::equal_digest(sha_b, inline_sha) {
+            let _ = posix::unlink_if_exists(allocator, part_b);
+            diag.clear();
+            diag.append_bytes(allocator, "sha256 mismatch for asset '") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, aname) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "': expected ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, inline_sha) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, ", got ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+            return Error::HashMismatch;
+        }
+    }
+
+    var key = string::new(allocator);
+    defer key.deinit(allocator);
+    store::format_asset_store_key(allocator, aname, aver, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    let kb = key.as_bytes();
+
+    var entry_dir = path::join(allocator, sd, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    defer entry_dir.deinit(allocator);
+    let edb = entry_dir.as_bytes();
+
+    var lock_name = string::new(allocator);
+    defer lock_name.deinit(allocator);
+    lock_name.append_bytes(allocator, "store-") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    lock_name.append_bytes(allocator, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    lock_name.append_bytes(allocator, ".lock") catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    let lnb = lock_name.as_bytes();
+    var lock_file = path::join(allocator, ld, lnb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    defer lock_file.deinit(allocator);
+    let lfb = lock_file.as_bytes();
+
+    var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return unlink_err(allocator, part_b, Error::IoFailed);
+    let existing = posix::inspect_path(handle, allocator, edb) catch return unlock_unlink_err(allocator, &var guard, part_b, Error::IoFailed);
+    if existing == posix::PathKind::Dir {
+        posix::touch_now(allocator, edb);
+        let _ = posix::unlink_if_exists(allocator, part_b);
+        posix::release_lock(&var guard);
+        return;
+    }
+    var actual_sha = string::new(allocator);
+    defer actual_sha.deinit(allocator);
+    if store::publish_verified_asset_file(handle, allocator, paths, asset, url_b, sha_b, part_b, seq, &var actual_sha) {} else |err| {
+        posix::release_lock(&var guard);
+        if err == store::Error::HashMismatch {
+            set_msg(allocator, diag, "sha256 mismatch during asset publish");
+            return Error::HashMismatch;
+        }
+        set_msg(allocator, diag, "failed to extract or publish asset into store");
+        return Error::StoreFailed;
+    }
+    posix::release_lock(&var guard);
+    return;
+}
+
+fn sync_loaded_manifest(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    m: &manifest::Manifest,
+    lf: &lockfile::Lockfile,
+    mpb: []u8,
+    lpb: []u8,
+    is_global: bool,
+    force: bool,
+    os: []u8,
+    arch_b: []u8,
+    out_max_size_bytes: &var i64,
+    diag: &var string::String,
+) -> Error!void {
+    let manifest_dir = path::dirname(mpb);
+    if m.store.has_max_size {
+        out_max_size_bytes.* = m.store.max_size_bytes;
+    }
+
+    var check_i = 0;
+    while m.tools.at(check_i) |tool| {
+        var u = string::new(allocator);
+        defer u.deinit(allocator);
+        var s = string::new(allocator);
+        defer s.deinit(allocator);
+        let ok = try resolve_tool_lock(allocator, tool, lf, os, arch_b, &var u, &var s);
+        if !ok {
+            let tname = tool.name.as_bytes();
+            let tver = tool.version.as_bytes();
+            diag.clear();
+            diag.append_bytes(allocator, "missing or outdated lock entry for '") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "' ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, tver) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, " (") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, os) catch return Error::OutOfMemory;
+            diag.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, arch_b) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "); run `kugi lock` first") catch return Error::OutOfMemory;
+            return Error::Unlocked;
+        }
+        check_i = check_i + 1;
+    }
+
+    var check_a = 0;
+    while m.assets.at(check_a) |asset| {
+        var u = string::new(allocator);
+        defer u.deinit(allocator);
+        var s = string::new(allocator);
+        defer s.deinit(allocator);
+        let ok = try resolve_asset_lock(allocator, asset, lf, os, arch_b, &var u, &var s);
+        if !ok {
+            let aname = asset.name.as_bytes();
+            let aver = asset.version.as_bytes();
+            diag.clear();
+            diag.append_bytes(allocator, "missing or outdated lock entry for asset '") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, aname) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "' ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, aver) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, " (") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, os) catch return Error::OutOfMemory;
+            diag.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, arch_b) catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, "); run `kugi lock` first") catch return Error::OutOfMemory;
+            return Error::Unlocked;
+        }
+        check_a = check_a + 1;
+    }
+
+    var store_keys = array::new<string::String>(allocator);
+    defer store_keys.deinit(allocator);
+
+    let sd = paths.store_dir.as_bytes();
+    let ld = paths.locks_dir.as_bytes();
+    let td = paths.tmp_dir.as_bytes();
+    let home_b = paths.home_dir.as_bytes();
+
+    var ti = 0;
+    while m.tools.at(ti) |tool| {
+        let tname = tool.name.as_bytes();
+        let tver = tool.version.as_bytes();
+        var url = string::new(allocator);
+        defer url.deinit(allocator);
+        var expected_sha = string::new(allocator);
+        defer expected_sha.deinit(allocator);
+        let _ = try resolve_tool_lock(allocator, tool, lf, os, arch_b, &var url, &var expected_sha);
+        let url_b = url.as_bytes();
+        let sha_b = expected_sha.as_bytes();
+
+        if tool.mode == manifest::InstallMode::Bootstrap {
+            var install_dir = string::new(allocator);
+            defer install_dir.deinit(allocator);
+            let raw_dir = tool.install_dir.as_bytes();
+            try resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var install_dir);
+            let idb = install_dir.as_bytes();
+
+            let already = store::bootstrap_all_present(handle, allocator, idb, tool) catch return Error::StoreFailed;
+            if !already {
+                var lock_name = string::new(allocator);
+                defer lock_name.deinit(allocator);
+                lock_name.append_bytes(allocator, "bootstrap-") catch return Error::OutOfMemory;
+                lock_name.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+                lock_name.append_bytes(allocator, ".lock") catch return Error::OutOfMemory;
+                let lnb = lock_name.as_bytes();
+                var lock_file = path::join(allocator, ld, lnb) catch return Error::OutOfMemory;
+                defer lock_file.deinit(allocator);
+                let lfb = lock_file.as_bytes();
+
+                var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+                let still_present = store::bootstrap_all_present(handle, allocator, idb, tool) catch return unlock_err(&var guard, Error::StoreFailed);
+                if !still_present {
+                    var nonce = string::new(allocator);
+                    defer nonce.deinit(allocator);
+                    store::make_nonce(allocator, ti + 1, &var nonce) catch return unlock_err(&var guard, Error::OutOfMemory);
+                    let nb = nonce.as_bytes();
+                    var part = string::new(allocator);
+                    defer part.deinit(allocator);
+                    part.append_bytes(allocator, td) catch return unlock_err(&var guard, Error::OutOfMemory);
+                    part.append_bytes(allocator, "/boot-") catch return unlock_err(&var guard, Error::OutOfMemory);
+                    part.append_bytes(allocator, nb) catch return unlock_err(&var guard, Error::OutOfMemory);
+                    part.append_bytes(allocator, ".part") catch return unlock_err(&var guard, Error::OutOfMemory);
+                    let part_b = part.as_bytes();
+
+                    var dl_sha = string::new(allocator);
+                    defer dl_sha.deinit(allocator);
+                    var status: i64 = 0;
+                    if fetch::download_to_file(handle, allocator, url_b, part_b, &var dl_sha, &var status) {} else |err| {
+                        let _ = posix::unlink_if_exists(allocator, part_b);
+                        posix::release_lock(&var guard);
+                        format_download_error(allocator, diag, tname, url_b, err, status);
+                        return Error::DownloadFailed;
+                    }
+                    let dsb = dl_sha.as_bytes();
+                    if !hash::equal_digest(dsb, sha_b) {
+                        let _ = posix::unlink_if_exists(allocator, part_b);
+                        posix::release_lock(&var guard);
+                        diag.clear();
+                        diag.append_bytes(allocator, "sha256 mismatch for '") catch return Error::OutOfMemory;
+                        diag.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+                        diag.append_bytes(allocator, "': expected ") catch return Error::OutOfMemory;
+                        diag.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+                        diag.append_bytes(allocator, ", got ") catch return Error::OutOfMemory;
+                        diag.append_bytes(allocator, dsb) catch return Error::OutOfMemory;
+                        return Error::HashMismatch;
+                    }
+                    var actual_sha = string::new(allocator);
+                    defer actual_sha.deinit(allocator);
+                    if store::install_bootstrap_file(handle, allocator, paths, tool, url_b, sha_b, part_b, idb, ti + 1, &var actual_sha) {} else |err| {
+                        posix::release_lock(&var guard);
+                        if err == store::Error::HashMismatch {
+                            set_msg(allocator, diag, "sha256 mismatch during bootstrap install");
+                            return Error::HashMismatch;
+                        }
+                        set_msg(allocator, diag, "failed to extract or install bootstrap tool");
+                        return Error::StoreFailed;
+                    }
+                }
+                posix::release_lock(&var guard);
+            }
+        } else {
+            var key = string::new(allocator);
+            defer key.deinit(allocator);
+            store::format_store_key(allocator, tname, tver, sha_b, &var key) catch return Error::OutOfMemory;
+            let kb = key.as_bytes();
+
+            var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
+            defer entry_dir.deinit(allocator);
+            let edb = entry_dir.as_bytes();
+
+            var lock_name = string::new(allocator);
+            defer lock_name.deinit(allocator);
+            lock_name.append_bytes(allocator, "store-") catch return Error::OutOfMemory;
+            lock_name.append_bytes(allocator, kb) catch return Error::OutOfMemory;
+            lock_name.append_bytes(allocator, ".lock") catch return Error::OutOfMemory;
+            let lnb = lock_name.as_bytes();
+            var lock_file = path::join(allocator, ld, lnb) catch return Error::OutOfMemory;
+            defer lock_file.deinit(allocator);
+            let lfb = lock_file.as_bytes();
+
+            var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+            let existing = posix::inspect_path(handle, allocator, edb) catch return unlock_err(&var guard, Error::IoFailed);
+            if existing == posix::PathKind::Dir {
+                posix::touch_now(allocator, edb);
+                posix::release_lock(&var guard);
+            } else {
+                var nonce = string::new(allocator);
+                defer nonce.deinit(allocator);
+                store::make_nonce(allocator, ti + 1, &var nonce) catch return unlock_err(&var guard, Error::OutOfMemory);
+                let nb = nonce.as_bytes();
+                var part = string::new(allocator);
+                defer part.deinit(allocator);
+                part.append_bytes(allocator, td) catch return unlock_err(&var guard, Error::OutOfMemory);
+                part.append_bytes(allocator, "/dl-") catch return unlock_err(&var guard, Error::OutOfMemory);
+                part.append_bytes(allocator, nb) catch return unlock_err(&var guard, Error::OutOfMemory);
+                part.append_bytes(allocator, ".part") catch return unlock_err(&var guard, Error::OutOfMemory);
+                let part_b = part.as_bytes();
+
+                var dl_sha = string::new(allocator);
+                defer dl_sha.deinit(allocator);
+                var status: i64 = 0;
+                if fetch::download_to_file(handle, allocator, url_b, part_b, &var dl_sha, &var status) {} else |err| {
+                    let _ = posix::unlink_if_exists(allocator, part_b);
+                    posix::release_lock(&var guard);
+                    format_download_error(allocator, diag, tname, url_b, err, status);
+                    return Error::DownloadFailed;
+                }
+                let dsb = dl_sha.as_bytes();
+                if !hash::equal_digest(dsb, sha_b) {
+                    let _ = posix::unlink_if_exists(allocator, part_b);
+                    posix::release_lock(&var guard);
+                    diag.clear();
+                    diag.append_bytes(allocator, "sha256 mismatch for '") catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, "': expected ") catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, ", got ") catch return Error::OutOfMemory;
+                    diag.append_bytes(allocator, dsb) catch return Error::OutOfMemory;
+                    return Error::HashMismatch;
+                }
+
+                var actual_sha = string::new(allocator);
+                defer actual_sha.deinit(allocator);
+                if store::publish_verified_file(handle, allocator, paths, tool, url_b, sha_b, part_b, ti + 1, &var actual_sha) {} else |err| {
+                    posix::release_lock(&var guard);
+                    if err == store::Error::HashMismatch {
+                        set_msg(allocator, diag, "sha256 mismatch during publish");
+                        return Error::HashMismatch;
+                    }
+                    set_msg(allocator, diag, "failed to extract or publish tool into store");
+                    return Error::StoreFailed;
+                }
+                posix::release_lock(&var guard);
+            }
+
+            let key_copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
+            store_keys.append(allocator, move key_copy) catch return Error::OutOfMemory;
+
+            if is_global {
+                try update_global_bin_links(allocator, paths, tool, kb, ti + 1);
+            }
+        }
+        ti = ti + 1;
+    }
+
+    var ai = 0;
+    while m.assets.at(ai) |asset| {
+        let aname = asset.name.as_bytes();
+        let aver = asset.version.as_bytes();
+        var url = string::new(allocator);
+        defer url.deinit(allocator);
+        var expected_sha = string::new(allocator);
+        defer expected_sha.deinit(allocator);
+        let _ = try resolve_asset_lock(allocator, asset, lf, os, arch_b, &var url, &var expected_sha);
+        let url_b = url.as_bytes();
+        let sha_b = expected_sha.as_bytes();
+
+        var key = string::new(allocator);
+        defer key.deinit(allocator);
+        store::format_asset_store_key(allocator, aname, aver, sha_b, &var key) catch return Error::OutOfMemory;
+        let kb = key.as_bytes();
+
+        var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
+        defer entry_dir.deinit(allocator);
+        let edb = entry_dir.as_bytes();
+
+        var lock_name = string::new(allocator);
+        defer lock_name.deinit(allocator);
+        lock_name.append_bytes(allocator, "store-") catch return Error::OutOfMemory;
+        lock_name.append_bytes(allocator, kb) catch return Error::OutOfMemory;
+        lock_name.append_bytes(allocator, ".lock") catch return Error::OutOfMemory;
+        let lnb = lock_name.as_bytes();
+        var lock_file = path::join(allocator, ld, lnb) catch return Error::OutOfMemory;
+        defer lock_file.deinit(allocator);
+        let lfb = lock_file.as_bytes();
+
+        var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+        let existing = posix::inspect_path(handle, allocator, edb) catch return unlock_err(&var guard, Error::IoFailed);
+        if existing == posix::PathKind::Dir {
+            posix::touch_now(allocator, edb);
+            posix::release_lock(&var guard);
+        } else {
+            var nonce = string::new(allocator);
+            defer nonce.deinit(allocator);
+            store::make_nonce(allocator, ti + ai + 1, &var nonce) catch return unlock_err(&var guard, Error::OutOfMemory);
+            let nb = nonce.as_bytes();
+            var part = string::new(allocator);
+            defer part.deinit(allocator);
+            part.append_bytes(allocator, td) catch return unlock_err(&var guard, Error::OutOfMemory);
+            part.append_bytes(allocator, "/dl-asset-") catch return unlock_err(&var guard, Error::OutOfMemory);
+            part.append_bytes(allocator, nb) catch return unlock_err(&var guard, Error::OutOfMemory);
+            part.append_bytes(allocator, ".part") catch return unlock_err(&var guard, Error::OutOfMemory);
+            let part_b = part.as_bytes();
+
+            var dl_sha = string::new(allocator);
+            defer dl_sha.deinit(allocator);
+            var status: i64 = 0;
+            if fetch::download_to_file(handle, allocator, url_b, part_b, &var dl_sha, &var status) {} else |err| {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+                posix::release_lock(&var guard);
+                format_download_error(allocator, diag, aname, url_b, err, status);
+                return Error::DownloadFailed;
+            }
+            let dsb = dl_sha.as_bytes();
+            if !hash::equal_digest(dsb, sha_b) {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+                posix::release_lock(&var guard);
+                diag.clear();
+                diag.append_bytes(allocator, "sha256 mismatch for asset '") catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, aname) catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, "': expected ") catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, ", got ") catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, dsb) catch return Error::OutOfMemory;
+                return Error::HashMismatch;
+            }
+
+            var actual_sha = string::new(allocator);
+            defer actual_sha.deinit(allocator);
+            if store::publish_verified_asset_file(handle, allocator, paths, asset, url_b, sha_b, part_b, ti + ai + 1, &var actual_sha) {} else |err| {
+                posix::release_lock(&var guard);
+                if err == store::Error::HashMismatch {
+                    set_msg(allocator, diag, "sha256 mismatch during asset publish");
+                    return Error::HashMismatch;
+                }
+                set_msg(allocator, diag, "failed to extract or publish asset into store");
+                return Error::StoreFailed;
+            }
+            posix::release_lock(&var guard);
+        }
+
+        let key_copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
+        store_keys.append(allocator, move key_copy) catch return Error::OutOfMemory;
+        ai = ai + 1;
+    }
+
+    try apply_links(handle, allocator, paths, m, manifest_dir, force, diag);
+
+    var rnonce = string::new(allocator);
+    defer rnonce.deinit(allocator);
+    store::make_nonce(allocator, 777, &var rnonce) catch return Error::OutOfMemory;
+    let rnb = rnonce.as_bytes();
+    roots::register_root(handle, allocator, paths, mpb, lpb, &store_keys, rnb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to register manifest root");
+    return;
+}
+
+pub struct TargetSpec {
+    pub os: string::String,
+    pub arch: string::String,
+    pub key: string::String,
+}
+
+pub fn (self: TargetSpec) deinit(allocator: Allocator) -> void {
+    self.os.deinit(allocator);
+    self.arch.deinit(allocator);
+    self.key.deinit(allocator);
+    return;
+}
+
+pub fn parse_target_spec(
+    allocator: Allocator,
+    raw: []u8,
+    diag: &var string::String,
+) -> Error!TargetSpec {
+    let length = mem::len(raw);
+    let dash = bytes::index_of_byte(raw, cast<u8>(45), 0) orelse -1;
+    if dash <= 0 or dash + 1 >= length {
+        diag.clear();
+        diag.append_bytes(allocator, "invalid target '") catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, raw) catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, "' (expected <os>-<arch>, e.g. darwin-aarch64 or linux-x86_64)") catch return Error::OutOfMemory;
+        return Error::UsageError;
+    }
+    if bytes::index_of_byte(raw, cast<u8>(45), dash + 1) |_| {
+        diag.clear();
+        diag.append_bytes(allocator, "invalid target '") catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, raw) catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, "' (expected <os>-<arch>, e.g. darwin-aarch64 or linux-x86_64)") catch return Error::OutOfMemory;
+        return Error::UsageError;
+    }
+    let os_part = raw[0..dash];
+    let arch_part = raw[dash + 1..length];
+    let os_ok = mem::equal_bytes(os_part, "darwin") or mem::equal_bytes(os_part, "linux");
+    let arch_ok = mem::equal_bytes(arch_part, "aarch64") or mem::equal_bytes(arch_part, "x86_64");
+    if !os_ok or !arch_ok {
+        diag.clear();
+        diag.append_bytes(allocator, "unsupported target '") catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, raw) catch return Error::OutOfMemory;
+        diag.append_bytes(allocator, "' (supported: darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64)") catch return Error::OutOfMemory;
+        return Error::UsageError;
+    }
+    var os_str = string::from_bytes(allocator, os_part) catch return Error::OutOfMemory;
+    errdefer os_str.deinit(allocator);
+    var arch_str = string::from_bytes(allocator, arch_part) catch return Error::OutOfMemory;
+    errdefer arch_str.deinit(allocator);
+    var key_str = string::from_bytes(allocator, raw) catch return Error::OutOfMemory;
+    errdefer key_str.deinit(allocator);
+    return TargetSpec {
+        os: move os_str,
+        arch: move arch_str,
+        key: move key_str,
+    };
+}
+
+fn targets_contains_key(targets: &array::Array<TargetSpec>, key: []u8) -> bool {
+    var i = 0;
+    while targets.at(i) |item| {
+        let kb = item.key.as_bytes();
+        if mem::equal_bytes(kb, key) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn array_contains_bytes(items: &array::Array<string::String>, needle: []u8) -> bool {
+    var i = 0;
+    while items.at(i) |item| {
+        let ib = item.as_bytes();
+        if mem::equal_bytes(ib, needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn run_lock(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    explicit_manifest: []u8,
+    only_tools: &array::Array<string::String>,
+    only_assets: &array::Array<string::String>,
+    explicit_targets: &array::Array<string::String>,
+    sync_after: bool,
+    out_max_size_bytes: &var i64,
+    diag: &var string::String,
+) -> Error!void {
+    out_max_size_bytes.* = 0;
+    store::ensure_layout(handle, allocator, paths) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create KUGI_HOME directories");
+
+    var manifest_path = string::new(allocator);
+    defer manifest_path.deinit(allocator);
+    var is_global = false;
+    try resolve_manifest_path(handle, allocator, paths, explicit_manifest, &var manifest_path, &var is_global, diag);
+    let mpb = manifest_path.as_bytes();
+    let manifest_dir = path::dirname(mpb);
+
+    var m = try load_manifest_file(handle, allocator, mpb, diag);
+    defer m.deinit(allocator);
+
+    var ft_i = 0;
+    while only_tools.at(ft_i) |t_arg| {
+        let tb = t_arg.as_bytes();
+        if manifest::find_tool_index(&m, tb) |_| {} else {
+            diag.clear();
+            diag.append_bytes(allocator, "tool not found in manifest: ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, tb) catch return Error::OutOfMemory;
+            return Error::UsageError;
+        }
+        ft_i = ft_i + 1;
+    }
+
+    var fa_i = 0;
+    while only_assets.at(fa_i) |a_arg| {
+        let ab = a_arg.as_bytes();
+        if manifest::find_asset_index(&m, ab) |_| {} else {
+            diag.clear();
+            diag.append_bytes(allocator, "asset not found in manifest: ") catch return Error::OutOfMemory;
+            diag.append_bytes(allocator, ab) catch return Error::OutOfMemory;
+            return Error::UsageError;
+        }
+        fa_i = fa_i + 1;
+    }
+
+    let has_filter = only_tools.len() > 0 or only_assets.len() > 0;
+
+    let host_os = posix::detect_os();
+    var host_arch = string::new(allocator);
+    defer host_arch.deinit(allocator);
+    posix::detect_arch(allocator, &var host_arch) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to detect host CPU architecture");
+    let host_arch_b = host_arch.as_bytes();
+
+    var targets = array::new<TargetSpec>(allocator);
+    defer targets.deinit(allocator);
+    if explicit_targets.len() == 0 {
+        var host_key = string::new(allocator);
+        defer host_key.deinit(allocator);
+        host_key.append_bytes(allocator, host_os) catch return Error::OutOfMemory;
+        host_key.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
+        host_key.append_bytes(allocator, host_arch_b) catch return Error::OutOfMemory;
+        let hkb = host_key.as_bytes();
+        let host_spec = try parse_target_spec(allocator, hkb, diag);
+        targets.append(allocator, move host_spec) catch return Error::OutOfMemory;
+    } else {
+        var ti_arg = 0;
+        while explicit_targets.at(ti_arg) |raw_t| {
+            let rtb = raw_t.as_bytes();
+            let spec = try parse_target_spec(allocator, rtb, diag);
+            if targets_contains_key(&targets, rtb) {
+                spec.deinit(allocator);
+            } else {
+                targets.append(allocator, move spec) catch return Error::OutOfMemory;
+            }
+            ti_arg = ti_arg + 1;
+        }
+    }
+
+    var lock_path = string::new(allocator);
+    defer lock_path.deinit(allocator);
+    try sibling_lockfile_path(allocator, mpb, &var lock_path);
+    let lpb = lock_path.as_bytes();
+
+    var lf_exists = false;
+    var lf = try load_lockfile_optional(handle, allocator, lpb, &var lf_exists, diag);
+    defer lf.deinit(allocator);
+
+    let td = paths.tmp_dir.as_bytes();
+    var seq: i64 = 0;
+    var i = 0;
+    while m.tools.at(i) |tool| {
+        let tname = tool.name.as_bytes();
+        if has_filter and !array_contains_bytes(only_tools, tname) {
+            i = i + 1;
+            continue;
+        }
+        var t_idx = 0;
+        while targets.at(t_idx) |target| {
+            let t_os = target.os.as_bytes();
+            let t_arch = target.arch.as_bytes();
+            let tkb = target.key.as_bytes();
+            let is_host = mem::equal_bytes(t_os, host_os) and mem::equal_bytes(t_arch, host_arch_b);
+            seq = seq + 1;
+            var url = string::new(allocator);
+            defer url.deinit(allocator);
+            manifest::resolve_tool_url(allocator, tool, t_os, t_arch, &var url) catch return Error::OutOfMemory;
+            let url_b = url.as_bytes();
+
+            var nonce = string::new(allocator);
+            defer nonce.deinit(allocator);
+            store::make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+            let nb = nonce.as_bytes();
+
+            var part = string::new(allocator);
+            defer part.deinit(allocator);
+            part.append_bytes(allocator, td) catch return Error::OutOfMemory;
+            part.append_bytes(allocator, "/lock-") catch return Error::OutOfMemory;
+            part.append_bytes(allocator, nb) catch return Error::OutOfMemory;
+            part.append_bytes(allocator, ".part") catch return Error::OutOfMemory;
+            let part_b = part.as_bytes();
+
+            var sha = string::new(allocator);
+            defer sha.deinit(allocator);
+            var status: i64 = 0;
+            if fetch::download_to_file(handle, allocator, url_b, part_b, &var sha, &var status) {} else |err| {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+                format_download_error(allocator, diag, tname, url_b, err, status);
+                return Error::DownloadFailed;
+            }
+
+            let ver_b = tool.version.as_bytes();
+            let sha_b = sha.as_bytes();
+            if sync_after and is_host {
+                try publish_locked_part(handle, allocator, paths, tool, manifest_dir, url_b, sha_b, part_b, seq, diag);
+            } else {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+            }
+            lockfile::set_target(allocator, &var lf, tname, ver_b, tkb, url_b, sha_b) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to record lock entry");
+
+            var line = string::new(allocator);
+            defer line.deinit(allocator);
+            line.append_bytes(allocator, "locked ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, tname) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, " ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, ver_b) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, " (") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, tkb) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, ") ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+            let lb = line.as_bytes();
+            let _ = io::write_stdout_line(handle, lb);
+            t_idx = t_idx + 1;
+        }
+        i = i + 1;
+    }
+
+    var ai = 0;
+    while m.assets.at(ai) |asset| {
+        let aname = asset.name.as_bytes();
+        if has_filter and !array_contains_bytes(only_assets, aname) {
+            ai = ai + 1;
+            continue;
+        }
+        var t_idx = 0;
+        while targets.at(t_idx) |target| {
+            let t_os = target.os.as_bytes();
+            let t_arch = target.arch.as_bytes();
+            let tkb = target.key.as_bytes();
+            let is_host = mem::equal_bytes(t_os, host_os) and mem::equal_bytes(t_arch, host_arch_b);
+            seq = seq + 1;
+            var url = string::new(allocator);
+            defer url.deinit(allocator);
+            manifest::resolve_asset_url(allocator, asset, t_os, t_arch, &var url) catch return Error::OutOfMemory;
+            let url_b = url.as_bytes();
+
+            var nonce = string::new(allocator);
+            defer nonce.deinit(allocator);
+            store::make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+            let nb = nonce.as_bytes();
+
+            var part = string::new(allocator);
+            defer part.deinit(allocator);
+            part.append_bytes(allocator, td) catch return Error::OutOfMemory;
+            part.append_bytes(allocator, "/lock-asset-") catch return Error::OutOfMemory;
+            part.append_bytes(allocator, nb) catch return Error::OutOfMemory;
+            part.append_bytes(allocator, ".part") catch return Error::OutOfMemory;
+            let part_b = part.as_bytes();
+
+            var sha = string::new(allocator);
+            defer sha.deinit(allocator);
+            var status: i64 = 0;
+            if fetch::download_to_file(handle, allocator, url_b, part_b, &var sha, &var status) {} else |err| {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+                format_download_error(allocator, diag, aname, url_b, err, status);
+                return Error::DownloadFailed;
+            }
+
+            let ver_b = asset.version.as_bytes();
+            let sha_b = sha.as_bytes();
+            if sync_after and is_host {
+                try publish_locked_asset_part(handle, allocator, paths, asset, url_b, sha_b, part_b, seq, diag);
+            } else {
+                let _ = posix::unlink_if_exists(allocator, part_b);
+            }
+            lockfile::set_asset_target(allocator, &var lf, aname, ver_b, tkb, url_b, sha_b) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to record asset lock entry");
+
+            var line = string::new(allocator);
+            defer line.deinit(allocator);
+            line.append_bytes(allocator, "locked asset ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, aname) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, " ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, ver_b) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, " (") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, tkb) catch return Error::OutOfMemory;
+            line.append_bytes(allocator, ") ") catch return Error::OutOfMemory;
+            line.append_bytes(allocator, sha_b) catch return Error::OutOfMemory;
+            let lb = line.as_bytes();
+            let _ = io::write_stdout_line(handle, lb);
+            t_idx = t_idx + 1;
+        }
+        ai = ai + 1;
+    }
+
+    var encoded = string::new(allocator);
+    defer encoded.deinit(allocator);
+    lockfile::encode(allocator, &lf, &var encoded) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to encode kugi.lock");
+    var wnonce = string::new(allocator);
+    defer wnonce.deinit(allocator);
+    store::make_nonce(allocator, 999, &var wnonce) catch return Error::OutOfMemory;
+    let enc_b = encoded.as_bytes();
+    let wnb = wnonce.as_bytes();
+    posix::write_file_atomic(handle, allocator, lpb, enc_b, wnb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to write kugi.lock");
+
+    if sync_after {
+        try sync_loaded_manifest(handle, allocator, paths, &m, &lf, mpb, lpb, is_global, false, host_os, host_arch_b, out_max_size_bytes, diag);
+    }
+    return;
+}
+
+pub fn run_sync(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    explicit_manifest: []u8,
+    force: bool,
+    out_max_size_bytes: &var i64,
+    diag: &var string::String,
+) -> Error!void {
+    out_max_size_bytes.* = 0;
+    store::ensure_layout(handle, allocator, paths) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create KUGI_HOME directories");
+
+    var manifest_path = string::new(allocator);
+    defer manifest_path.deinit(allocator);
+    var is_global = false;
+    try resolve_manifest_path(handle, allocator, paths, explicit_manifest, &var manifest_path, &var is_global, diag);
+    let mpb = manifest_path.as_bytes();
+
+    var m = try load_manifest_file(handle, allocator, mpb, diag);
+    defer m.deinit(allocator);
+
+    var lock_path = string::new(allocator);
+    defer lock_path.deinit(allocator);
+    try sibling_lockfile_path(allocator, mpb, &var lock_path);
+    let lpb = lock_path.as_bytes();
+
+    var lf_exists = false;
+    var lf = try load_lockfile_optional(handle, allocator, lpb, &var lf_exists, diag);
+    defer lf.deinit(allocator);
+
+    let os = posix::detect_os();
+    var arch = string::new(allocator);
+    defer arch.deinit(allocator);
+    posix::detect_arch(allocator, &var arch) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to detect host CPU architecture");
+    let arch_b = arch.as_bytes();
+
+    try sync_loaded_manifest(handle, allocator, paths, &m, &lf, mpb, lpb, is_global, force, os, arch_b, out_max_size_bytes, diag);
+    return;
+}
+
+test "apply_links protects regular files unless forced" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-links-test-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+    let _ = posix::create_dir_all(handle, allocator, base_bytes);
+
+    var gm = path::join(allocator, base_bytes, "kugi.toml") catch return;
+    defer gm.deinit(allocator);
+    let gmb = gm.as_bytes();
+    var paths = store::paths_from_root(allocator, base_bytes, base_bytes, gmb) catch return;
+    defer paths.deinit(allocator);
+
+    var src_file = path::join(allocator, base_bytes, "dot-rc") catch return;
+    defer src_file.deinit(allocator);
+    let sfb = src_file.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, sfb, "from-configs", "1");
+
+    var user_file = path::join(allocator, base_bytes, "dest-rc") catch return;
+    defer user_file.deinit(allocator);
+    let ufb = user_file.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, ufb, "user-owned", "2");
+
+    let doc =
+        \\[links]
+        \\"~/dest-rc" = "~/dot-rc"
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if apply_links(handle, allocator, &paths, &m, base_bytes, false, &var diag) {
+            testing::fail("apply_links without --force must refuse overwriting a regular file");
+        } else |err| {
+            testing::expect(err == Error::LinkConflict);
+        }
+        if fs::read_file(handle, allocator, ufb, mem::Limit::Bytes(1024)) |content| {
+            defer content.deinit(allocator);
+            let cb = content.as_bytes();
+            testing::expect_equal<[]u8>("user-owned", cb);
+        } else |_| {
+            testing::fail("user file was corrupted");
+        }
+        if apply_links(handle, allocator, &paths, &m, base_bytes, true, &var diag) {
+            if posix::inspect_path(handle, allocator, ufb) |k| {
+                testing::expect(k == posix::PathKind::Symlink);
+            } else |_| {
+                testing::fail("inspect forced link failed");
+            }
+        } else |_| {
+            testing::fail("apply_links with --force should succeed");
+        }
+    } else |_| {
+        testing::fail("parse manifest failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}
+
+test "parse_target_spec validates supported targets" {
+    let allocator = mem::page_allocator();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+
+    if parse_target_spec(allocator, "darwin-aarch64", &var diag) |t| {
+        defer t.deinit(allocator);
+        let os = t.os.as_bytes();
+        let arch = t.arch.as_bytes();
+        let key = t.key.as_bytes();
+        testing::expect_equal<[]u8>("darwin", os);
+        testing::expect_equal<[]u8>("aarch64", arch);
+        testing::expect_equal<[]u8>("darwin-aarch64", key);
+    } else |_| {
+        testing::fail("darwin-aarch64 should parse");
+    }
+
+    if parse_target_spec(allocator, "linux-x86_64", &var diag) |t| {
+        defer t.deinit(allocator);
+        let os = t.os.as_bytes();
+        let arch = t.arch.as_bytes();
+        testing::expect_equal<[]u8>("linux", os);
+        testing::expect_equal<[]u8>("x86_64", arch);
+    } else |_| {
+        testing::fail("linux-x86_64 should parse");
+    }
+
+    if parse_target_spec(allocator, "darwin-x86_64", &var diag) |t| {
+        t.deinit(allocator);
+    } else |_| {
+        testing::fail("darwin-x86_64 should parse");
+    }
+
+    if parse_target_spec(allocator, "linux-aarch64", &var diag) |t| {
+        t.deinit(allocator);
+    } else |_| {
+        testing::fail("linux-aarch64 should parse");
+    }
+
+    if parse_target_spec(allocator, "invalid", &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("target without dash must fail");
+    } else |err| {
+        testing::expect(err == Error::UsageError);
+    }
+
+    if parse_target_spec(allocator, "windows-x86_64", &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("unsupported os must fail");
+    } else |err| {
+        testing::expect(err == Error::UsageError);
+    }
+
+    if parse_target_spec(allocator, "linux-arm64", &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("non-canonical arch must fail");
+    } else |err| {
+        testing::expect(err == Error::UsageError);
+    }
+
+    if parse_target_spec(allocator, "linux-x86_64-gnu", &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("extra dash in target must fail");
+    } else |err| {
+        testing::expect(err == Error::UsageError);
+    }
+}
+
+fn expect_download_diag(
+    allocator: Allocator,
+    err: fetch::Error,
+    status: i64,
+    expected: []u8,
+) -> void {
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    format_download_error(allocator, &var diag, "demo", "https://example.com/a.tgz", err, status);
+    let actual = diag.as_bytes();
+    testing::expect_equal<[]u8>(expected, actual);
+    return;
+}
+
+test "format_download_error includes specific failure reasons" {
+    let allocator = mem::page_allocator();
+    expect_download_diag(
+        allocator,
+        fetch::Error::HttpStatus,
+        404,
+        "failed to download 'demo' from https://example.com/a.tgz: HTTP 404",
+    );
+    expect_download_diag(
+        allocator,
+        fetch::Error::NetworkFailed,
+        0,
+        "failed to download 'demo' from https://example.com/a.tgz: TLS / network error",
+    );
+    expect_download_diag(
+        allocator,
+        fetch::Error::TooManyRedirects,
+        302,
+        "failed to download 'demo' from https://example.com/a.tgz: too many redirects",
+    );
+    expect_download_diag(
+        allocator,
+        fetch::Error::InsecureRedirect,
+        302,
+        "failed to download 'demo' from https://example.com/a.tgz: insecure redirect (https -> http)",
+    );
+    expect_download_diag(
+        allocator,
+        fetch::Error::NoTrustedRoots,
+        0,
+        "failed to download 'demo' from https://example.com/a.tgz: no trusted CA certificates found",
+    );
+}

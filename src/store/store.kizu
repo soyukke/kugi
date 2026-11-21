@@ -1,0 +1,671 @@
+import kugi::archive;
+import kugi::hash;
+import kugi::manifest;
+import kugi::posix;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::mem;
+import std::path;
+import std::process;
+import std::string;
+import std::testing;
+
+pub error Error {
+    MissingHome,
+    HashMismatch,
+    ArchiveFailed,
+    IoFailed,
+    OutOfMemory,
+}
+
+pub struct Paths {
+    pub home_dir: string::String,
+    pub kugi_home: string::String,
+    pub store_dir: string::String,
+    pub bin_dir: string::String,
+    pub roots_dir: string::String,
+    pub locks_dir: string::String,
+    pub tmp_dir: string::String,
+    pub global_manifest: string::String,
+}
+
+pub fn (self: Paths) deinit(allocator: Allocator) -> void {
+    self.home_dir.deinit(allocator);
+    self.kugi_home.deinit(allocator);
+    self.store_dir.deinit(allocator);
+    self.bin_dir.deinit(allocator);
+    self.roots_dir.deinit(allocator);
+    self.locks_dir.deinit(allocator);
+    self.tmp_dir.deinit(allocator);
+    self.global_manifest.deinit(allocator);
+    return;
+}
+
+fn join_under(allocator: Allocator, base: &string::String, child: []u8) -> Error!string::String {
+    let bb = base.as_bytes();
+    let joined = path::join(allocator, bb, child) catch return Error::OutOfMemory;
+    return move joined;
+}
+
+pub fn paths_from_root(
+    allocator: Allocator,
+    kugi_home_bytes: []u8,
+    home_bytes: []u8,
+    global_manifest_bytes: []u8,
+) -> Error!Paths {
+    var home_dir = string::from_bytes(allocator, home_bytes) catch return Error::OutOfMemory;
+    errdefer home_dir.deinit(allocator);
+    var kugi_home = string::from_bytes(allocator, kugi_home_bytes) catch return Error::OutOfMemory;
+    errdefer kugi_home.deinit(allocator);
+    var global_manifest = string::from_bytes(allocator, global_manifest_bytes) catch return Error::OutOfMemory;
+    errdefer global_manifest.deinit(allocator);
+    var store_dir = try join_under(allocator, &kugi_home, "store");
+    errdefer store_dir.deinit(allocator);
+    var bin_dir = try join_under(allocator, &kugi_home, "bin");
+    errdefer bin_dir.deinit(allocator);
+    var roots_dir = try join_under(allocator, &kugi_home, "roots");
+    errdefer roots_dir.deinit(allocator);
+    var locks_dir = try join_under(allocator, &kugi_home, "locks");
+    errdefer locks_dir.deinit(allocator);
+    var tmp_dir = try join_under(allocator, &kugi_home, "tmp");
+    errdefer tmp_dir.deinit(allocator);
+    return Paths {
+        home_dir: move home_dir,
+        kugi_home: move kugi_home,
+        store_dir: move store_dir,
+        bin_dir: move bin_dir,
+        roots_dir: move roots_dir,
+        locks_dir: move locks_dir,
+        tmp_dir: move tmp_dir,
+        global_manifest: move global_manifest,
+    };
+}
+
+pub fn resolve_paths(allocator: Allocator) -> Error!Paths {
+    let home = process::env("HOME") orelse "";
+    var home_dir = string::from_bytes(allocator, home) catch return Error::OutOfMemory;
+    errdefer home_dir.deinit(allocator);
+
+    var kugi_home = string::new(allocator);
+    errdefer kugi_home.deinit(allocator);
+    if process::env("KUGI_HOME") |kh| {
+        if mem::len(kh) > 0 {
+            kugi_home.append_bytes(allocator, kh) catch return Error::OutOfMemory;
+        }
+    }
+    if kugi_home.len() == 0 {
+        if process::env("XDG_DATA_HOME") |xdg_data| {
+            if mem::len(xdg_data) > 0 {
+                var joined = path::join(allocator, xdg_data, "kugi") catch return Error::OutOfMemory;
+                defer joined.deinit(allocator);
+                let jb = joined.as_bytes();
+                kugi_home.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+            }
+        }
+    }
+    if kugi_home.len() == 0 {
+        if mem::len(home) == 0 {
+            return Error::MissingHome;
+        }
+        var joined = path::join(allocator, home, ".local/share/kugi") catch return Error::OutOfMemory;
+        defer joined.deinit(allocator);
+        let jb = joined.as_bytes();
+        kugi_home.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+    }
+
+    var global_manifest = string::new(allocator);
+    errdefer global_manifest.deinit(allocator);
+    if process::env("XDG_CONFIG_HOME") |xdg_cfg| {
+        if mem::len(xdg_cfg) > 0 {
+            var joined = path::join(allocator, xdg_cfg, "kugi/kugi.toml") catch return Error::OutOfMemory;
+            defer joined.deinit(allocator);
+            let jb = joined.as_bytes();
+            global_manifest.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+        }
+    }
+    if global_manifest.len() == 0 {
+        if mem::len(home) > 0 {
+            var joined = path::join(allocator, home, ".config/kugi/kugi.toml") catch return Error::OutOfMemory;
+            defer joined.deinit(allocator);
+            let jb = joined.as_bytes();
+            global_manifest.append_bytes(allocator, jb) catch return Error::OutOfMemory;
+        }
+    }
+
+    var store_dir = try join_under(allocator, &kugi_home, "store");
+    errdefer store_dir.deinit(allocator);
+    var bin_dir = try join_under(allocator, &kugi_home, "bin");
+    errdefer bin_dir.deinit(allocator);
+    var roots_dir = try join_under(allocator, &kugi_home, "roots");
+    errdefer roots_dir.deinit(allocator);
+    var locks_dir = try join_under(allocator, &kugi_home, "locks");
+    errdefer locks_dir.deinit(allocator);
+    var tmp_dir = try join_under(allocator, &kugi_home, "tmp");
+    errdefer tmp_dir.deinit(allocator);
+
+    return Paths {
+        home_dir: move home_dir,
+        kugi_home: move kugi_home,
+        store_dir: move store_dir,
+        bin_dir: move bin_dir,
+        roots_dir: move roots_dir,
+        locks_dir: move locks_dir,
+        tmp_dir: move tmp_dir,
+        global_manifest: move global_manifest,
+    };
+}
+
+pub fn ensure_layout(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+) -> Error!void {
+    let sd = paths.store_dir.as_bytes();
+    let bd = paths.bin_dir.as_bytes();
+    let rd = paths.roots_dir.as_bytes();
+    let ld = paths.locks_dir.as_bytes();
+    let td = paths.tmp_dir.as_bytes();
+    posix::create_dir_all(handle, allocator, sd) catch return Error::IoFailed;
+    posix::create_dir_all(handle, allocator, bd) catch return Error::IoFailed;
+    posix::create_dir_all(handle, allocator, rd) catch return Error::IoFailed;
+    posix::create_dir_all(handle, allocator, ld) catch return Error::IoFailed;
+    posix::create_dir_all(handle, allocator, td) catch return Error::IoFailed;
+    return;
+}
+
+pub fn format_store_key(
+    allocator: Allocator,
+    name: []u8,
+    version: []u8,
+    sha256: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    try out.append_bytes(allocator, name);
+    try out.append_byte(allocator, cast<u8>(45));
+    try out.append_bytes(allocator, version);
+    try out.append_byte(allocator, cast<u8>(45));
+    var prefix_len = mem::len(sha256);
+    if prefix_len > 12 {
+        prefix_len = 12;
+    }
+    try out.append_bytes(allocator, sha256[0..prefix_len]);
+    return;
+}
+
+pub fn format_asset_store_key(
+    allocator: Allocator,
+    name: []u8,
+    version: []u8,
+    sha256: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    try out.append_bytes(allocator, "asset-");
+    return format_store_key(allocator, name, version, sha256, out);
+}
+
+pub fn format_root_id(
+    allocator: Allocator,
+    canonical_manifest_path: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    try hash::sha256_hex_prefix(allocator, canonical_manifest_path, 16, out);
+    return;
+}
+
+pub fn make_nonce(
+    allocator: Allocator,
+    seq: i64,
+    out: &var string::String,
+) -> mem::Error!void {
+    try fmt::append_i64(allocator, out, posix::pid());
+    try out.append_byte(allocator, cast<u8>(45));
+    try fmt::append_i64(allocator, out, process::monotonic_millis());
+    try out.append_byte(allocator, cast<u8>(45));
+    try fmt::append_i64(allocator, out, seq);
+    return;
+}
+
+pub fn publish_verified_file(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+    tool: &manifest::ToolSpec,
+    url_hint: []u8,
+    expected_sha: []u8,
+    part_path: []u8,
+    seq: i64,
+    out_actual_sha: &var string::String,
+) -> Error!void {
+    let tname = tool.name.as_bytes();
+    let tver = tool.version.as_bytes();
+    var key = string::new(allocator);
+    defer key.deinit(allocator);
+    format_store_key(allocator, tname, tver, expected_sha, &var key) catch return Error::OutOfMemory;
+    let kb = key.as_bytes();
+
+    let sd = paths.store_dir.as_bytes();
+    var final_target = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
+    defer final_target.deinit(allocator);
+    let ftb = final_target.as_bytes();
+
+    var actual = string::new(allocator);
+    defer actual.deinit(allocator);
+    if posix::hash_file_sha256(allocator, part_path, &var actual) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::IoFailed;
+    }
+    let actual_b = actual.as_bytes();
+    if !hash::equal_digest(actual_b, expected_sha) {
+        out_actual_sha.clear();
+        out_actual_sha.append_bytes(allocator, actual_b) catch return Error::OutOfMemory;
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::HashMismatch;
+    }
+
+    var nonce = string::new(allocator);
+    defer nonce.deinit(allocator);
+    make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+    let nb = nonce.as_bytes();
+
+    let td = paths.tmp_dir.as_bytes();
+    var staged_dir = string::new(allocator);
+    defer staged_dir.deinit(allocator);
+    if archive::stage_store_entry(handle, allocator, part_path, url_hint, tool, td, nb, &var staged_dir) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::ArchiveFailed;
+    }
+    let _ = posix::unlink_if_exists(allocator, part_path);
+    let staged_b = staged_dir.as_bytes();
+
+    let existing_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+    if existing_kind == posix::PathKind::Dir {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        posix::touch_now(allocator, ftb);
+        return;
+    }
+    if posix::rename_path(allocator, staged_b, ftb) {
+        posix::touch_now(allocator, ftb);
+        return;
+    } else |_| {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        let after_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+        if after_kind == posix::PathKind::Dir {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
+    }
+}
+
+pub fn publish_verified_asset_file(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+    asset: &manifest::AssetSpec,
+    url_hint: []u8,
+    expected_sha: []u8,
+    part_path: []u8,
+    seq: i64,
+    out_actual_sha: &var string::String,
+) -> Error!void {
+    let aname = asset.name.as_bytes();
+    let aver = asset.version.as_bytes();
+    var key = string::new(allocator);
+    defer key.deinit(allocator);
+    format_asset_store_key(allocator, aname, aver, expected_sha, &var key) catch return Error::OutOfMemory;
+    let kb = key.as_bytes();
+
+    let sd = paths.store_dir.as_bytes();
+    var final_target = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
+    defer final_target.deinit(allocator);
+    let ftb = final_target.as_bytes();
+
+    var actual = string::new(allocator);
+    defer actual.deinit(allocator);
+    if posix::hash_file_sha256(allocator, part_path, &var actual) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::IoFailed;
+    }
+    let actual_b = actual.as_bytes();
+    if !hash::equal_digest(actual_b, expected_sha) {
+        out_actual_sha.clear();
+        out_actual_sha.append_bytes(allocator, actual_b) catch return Error::OutOfMemory;
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::HashMismatch;
+    }
+
+    var nonce = string::new(allocator);
+    defer nonce.deinit(allocator);
+    make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+    let nb = nonce.as_bytes();
+
+    let td = paths.tmp_dir.as_bytes();
+    var staged_dir = string::new(allocator);
+    defer staged_dir.deinit(allocator);
+    if archive::stage_asset_entry(handle, allocator, part_path, url_hint, asset, td, nb, &var staged_dir) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::ArchiveFailed;
+    }
+    let _ = posix::unlink_if_exists(allocator, part_path);
+    let staged_b = staged_dir.as_bytes();
+
+    let existing_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+    if existing_kind == posix::PathKind::Dir {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        posix::touch_now(allocator, ftb);
+        return;
+    }
+    if posix::rename_path(allocator, staged_b, ftb) {
+        posix::touch_now(allocator, ftb);
+        return;
+    } else |_| {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        let after_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+        if after_kind == posix::PathKind::Dir {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
+    }
+}
+
+pub fn bootstrap_all_present(
+    handle: Io,
+    allocator: Allocator,
+    install_dir: []u8,
+    tool: &manifest::ToolSpec,
+) -> Error!bool {
+    var i = 0;
+    while tool.bins.at(i) |bspec| {
+        let dest = bspec.dest.as_bytes();
+        var dst_path = path::join(allocator, install_dir, dest) catch return Error::OutOfMemory;
+        defer dst_path.deinit(allocator);
+        let dpb = dst_path.as_bytes();
+        let kind = posix::inspect_path(handle, allocator, dpb) catch return Error::IoFailed;
+        if kind == posix::PathKind::Missing {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn cleanup_and_oom(handle: Io, allocator: Allocator, staged_b: []u8) -> Error {
+    let _ = posix::remove_tree(handle, allocator, staged_b);
+    return Error::OutOfMemory;
+}
+
+fn cleanup_and_io(handle: Io, allocator: Allocator, staged_b: []u8) -> Error {
+    let _ = posix::remove_tree(handle, allocator, staged_b);
+    return Error::IoFailed;
+}
+
+pub fn install_bootstrap_file(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+    tool: &manifest::ToolSpec,
+    url_hint: []u8,
+    expected_sha: []u8,
+    part_path: []u8,
+    install_dir: []u8,
+    seq: i64,
+    out_actual_sha: &var string::String,
+) -> Error!void {
+    var actual = string::new(allocator);
+    defer actual.deinit(allocator);
+    if posix::hash_file_sha256(allocator, part_path, &var actual) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::IoFailed;
+    }
+    let actual_b = actual.as_bytes();
+    if !hash::equal_digest(actual_b, expected_sha) {
+        out_actual_sha.clear();
+        out_actual_sha.append_bytes(allocator, actual_b) catch return Error::OutOfMemory;
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::HashMismatch;
+    }
+
+    var nonce = string::new(allocator);
+    defer nonce.deinit(allocator);
+    make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+    let nb = nonce.as_bytes();
+
+    let td = paths.tmp_dir.as_bytes();
+    var staged_dir = string::new(allocator);
+    defer staged_dir.deinit(allocator);
+    if archive::stage_store_entry(handle, allocator, part_path, url_hint, tool, td, nb, &var staged_dir) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, part_path);
+        return Error::ArchiveFailed;
+    }
+    let _ = posix::unlink_if_exists(allocator, part_path);
+    let staged_b = staged_dir.as_bytes();
+
+    if posix::create_dir_all(handle, allocator, install_dir) {} else |_| {
+        return cleanup_and_io(handle, allocator, staged_b);
+    }
+
+    var staged_bin_dir = path::join(allocator, staged_b, "bin") catch return cleanup_and_oom(handle, allocator, staged_b);
+    defer staged_bin_dir.deinit(allocator);
+    let sbdb = staged_bin_dir.as_bytes();
+
+    var bi = 0;
+    while tool.bins.at(bi) |bspec| {
+        let dest = bspec.dest.as_bytes();
+        var dst_path = path::join(allocator, install_dir, dest) catch return cleanup_and_oom(handle, allocator, staged_b);
+        defer dst_path.deinit(allocator);
+        let dpb = dst_path.as_bytes();
+        let kind = posix::inspect_path(handle, allocator, dpb) catch return cleanup_and_io(handle, allocator, staged_b);
+        if kind == posix::PathKind::Missing {
+            var src_path = path::join(allocator, sbdb, dest) catch return cleanup_and_oom(handle, allocator, staged_b);
+            defer src_path.deinit(allocator);
+            let spb = src_path.as_bytes();
+
+            var tmp_bin = string::new(allocator);
+            defer tmp_bin.deinit(allocator);
+            tmp_bin.append_bytes(allocator, install_dir) catch return cleanup_and_oom(handle, allocator, staged_b);
+            tmp_bin.append_bytes(allocator, "/.kugi-bootstrap-") catch return cleanup_and_oom(handle, allocator, staged_b);
+            tmp_bin.append_bytes(allocator, nb) catch return cleanup_and_oom(handle, allocator, staged_b);
+            tmp_bin.append_byte(allocator, cast<u8>(45)) catch return cleanup_and_oom(handle, allocator, staged_b);
+            fmt::append_i64(allocator, &var tmp_bin, bi) catch return cleanup_and_oom(handle, allocator, staged_b);
+            let tbb = tmp_bin.as_bytes();
+
+            if posix::copy_file_streaming(allocator, spb, tbb) {} else |_| {
+                let _ = posix::unlink_if_exists(allocator, tbb);
+                let _ = posix::remove_tree(handle, allocator, staged_b);
+                return Error::IoFailed;
+            }
+            if posix::set_executable(allocator, tbb) {} else |_| {
+                let _ = posix::unlink_if_exists(allocator, tbb);
+                let _ = posix::remove_tree(handle, allocator, staged_b);
+                return Error::IoFailed;
+            }
+            if posix::hardlink_no_clobber(allocator, tbb, dpb) |_| {
+                let _ = posix::unlink_if_exists(allocator, tbb);
+            } else |_| {
+                let _ = posix::unlink_if_exists(allocator, tbb);
+                let _ = posix::remove_tree(handle, allocator, staged_b);
+                return Error::IoFailed;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    let _ = posix::remove_tree(handle, allocator, staged_b);
+    return;
+}
+
+test "store hash verification publish and bootstrap no-clobber" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-store-test-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+
+    var gm = path::join(allocator, base_bytes, "kugi.toml") catch return;
+    defer gm.deinit(allocator);
+    let gmb = gm.as_bytes();
+    var paths = paths_from_root(allocator, base_bytes, base_bytes, gmb) catch return;
+    defer paths.deinit(allocator);
+
+    if ensure_layout(handle, allocator, &paths) {} else |_| {
+        testing::fail("ensure_layout failed");
+        return;
+    }
+
+    let payload = "#!/bin/sh\necho v1\n";
+    var good_sha = string::new(allocator);
+    defer good_sha.deinit(allocator);
+    hash::sha256_hex(allocator, payload, &var good_sha) catch return;
+    let good_sha_b = good_sha.as_bytes();
+
+    let mdoc =
+        \\[tools.demo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/demo"
+        \\archive = "none"
+        \\bin = ["demo"]
+        \\
+        \\[tools.boot]
+        \\version = "1.0.0"
+        \\url = "https://example.com/boot"
+        \\archive = "none"
+        \\mode = "bootstrap"
+        \\install_dir = "~/bootbin"
+        \\bin = ["boot"]
+        \\
+        \\[assets.pack]
+        \\version = "1.0.0"
+        \\url = "https://example.com/packs/data.bin"
+        \\archive = "none"
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, mdoc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.tools.at(0) |demo| {
+            let td = paths.tmp_dir.as_bytes();
+            var bad_part = path::join(allocator, td, "bad.part") catch return;
+            defer bad_part.deinit(allocator);
+            let bpb = bad_part.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, bpb, "tampered", "1");
+            var actual = string::new(allocator);
+            defer actual.deinit(allocator);
+            if publish_verified_file(handle, allocator, &paths, demo, "https://example.com/demo", good_sha_b, bpb, 1, &var actual) {
+                testing::fail("hash mismatch should have failed");
+            } else |_| {}
+            if posix::inspect_path(handle, allocator, bpb) |k| {
+                testing::expect(k == posix::PathKind::Missing);
+            } else |_| {
+                testing::fail("inspect bad part failed");
+            }
+
+            var good_part = path::join(allocator, td, "good.part") catch return;
+            defer good_part.deinit(allocator);
+            let gpb = good_part.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, gpb, payload, "2");
+            if publish_verified_file(handle, allocator, &paths, demo, "https://example.com/demo", good_sha_b, gpb, 2, &var actual) {} else |_| {
+                testing::fail("publish valid file failed");
+            }
+            var sk = string::new(allocator);
+            defer sk.deinit(allocator);
+            format_store_key(allocator, "demo", "1.0.0", good_sha_b, &var sk) catch return;
+            let skb = sk.as_bytes();
+            let sd = paths.store_dir.as_bytes();
+            var store_entry = path::join(allocator, sd, skb) catch return;
+            defer store_entry.deinit(allocator);
+            let seb = store_entry.as_bytes();
+            var bin_path = path::join(allocator, seb, "bin/demo") catch return;
+            defer bin_path.deinit(allocator);
+            let bin_b = bin_path.as_bytes();
+            if posix::inspect_path(handle, allocator, bin_b) |k| {
+                testing::expect(k == posix::PathKind::File);
+            } else |_| {
+                testing::fail("published bin missing");
+            }
+        }
+        if m.tools.at(1) |boot| {
+            var boot_dir = path::join(allocator, base_bytes, "bootbin") catch return;
+            defer boot_dir.deinit(allocator);
+            let bdb = boot_dir.as_bytes();
+            let td = paths.tmp_dir.as_bytes();
+
+            var part1 = path::join(allocator, td, "boot1.part") catch return;
+            defer part1.deinit(allocator);
+            let p1b = part1.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, p1b, payload, "3");
+            var actual = string::new(allocator);
+            defer actual.deinit(allocator);
+            if install_bootstrap_file(handle, allocator, &paths, boot, "https://example.com/boot", good_sha_b, p1b, bdb, 3, &var actual) {} else |_| {
+                testing::fail("initial bootstrap install failed");
+            }
+            var boot_bin = path::join(allocator, bdb, "boot") catch return;
+            defer boot_bin.deinit(allocator);
+            let bbb = boot_bin.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, bbb, "self-updated-v2", "4");
+
+            var part2 = path::join(allocator, td, "boot2.part") catch return;
+            defer part2.deinit(allocator);
+            let p2b = part2.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, p2b, payload, "5");
+            if install_bootstrap_file(handle, allocator, &paths, boot, "https://example.com/boot", good_sha_b, p2b, bdb, 5, &var actual) {} else |_| {
+                testing::fail("second bootstrap install failed");
+            }
+            if fs::read_file(handle, allocator, bbb, mem::Limit::Bytes(1024)) |content| {
+                defer content.deinit(allocator);
+                let cb = content.as_bytes();
+                testing::expect_equal<[]u8>("self-updated-v2", cb);
+            } else |_| {
+                testing::fail("read bootstrap bin failed");
+            }
+        }
+        if m.assets.at(0) |pack| {
+            let td = paths.tmp_dir.as_bytes();
+            var bad_part = path::join(allocator, td, "bad-asset.part") catch return;
+            defer bad_part.deinit(allocator);
+            let bpb = bad_part.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, bpb, "tampered", "6");
+            var actual = string::new(allocator);
+            defer actual.deinit(allocator);
+            if publish_verified_asset_file(handle, allocator, &paths, pack, "https://example.com/packs/data.bin", good_sha_b, bpb, 6, &var actual) {
+                testing::fail("asset hash mismatch should have failed");
+            } else |_| {}
+
+            var good_part = path::join(allocator, td, "good-asset.part") catch return;
+            defer good_part.deinit(allocator);
+            let gpb = good_part.as_bytes();
+            let _ = posix::write_file_atomic(handle, allocator, gpb, payload, "7");
+            if publish_verified_asset_file(handle, allocator, &paths, pack, "https://example.com/packs/data.bin", good_sha_b, gpb, 7, &var actual) {} else |_| {
+                testing::fail("publish valid asset failed");
+            }
+            var ak = string::new(allocator);
+            defer ak.deinit(allocator);
+            format_asset_store_key(allocator, "pack", "1.0.0", good_sha_b, &var ak) catch return;
+            let akb = ak.as_bytes();
+            testing::expect(mem::starts_with(akb, "asset-pack-1.0.0-"));
+            let sd = paths.store_dir.as_bytes();
+            var asset_entry = path::join(allocator, sd, akb) catch return;
+            defer asset_entry.deinit(allocator);
+            let aeb = asset_entry.as_bytes();
+            var data_path = path::join(allocator, aeb, "data.bin") catch return;
+            defer data_path.deinit(allocator);
+            let dpb = data_path.as_bytes();
+            if posix::inspect_path(handle, allocator, dpb) |k| {
+                testing::expect(k == posix::PathKind::File);
+            } else |_| {
+                testing::fail("published asset data.bin missing");
+            }
+        }
+    } else |_| {
+        testing::fail("parse manifest failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}

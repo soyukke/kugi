@@ -1,0 +1,953 @@
+import kugi::bytes;
+import kugi::hash;
+import kugi::posix;
+import std::array;
+import std::crypto::x509;
+import std::fmt;
+import std::fs;
+import std::http;
+import std::io;
+import std::mem;
+import std::path;
+import std::process;
+import std::string;
+import std::testing;
+
+pub error Error {
+    InvalidUrl,
+    NoTrustedRoots,
+    TooManyRedirects,
+    InsecureRedirect,
+    HttpStatus,
+    NetworkFailed,
+    IoFailed,
+    OutOfMemory,
+}
+
+enum HopOutcome {
+    Done,
+    Redirect,
+    FallbackCurl,
+}
+
+pub fn format_error_reason(
+    allocator: Allocator,
+    err: Error,
+    status: i64,
+    out: &var string::String,
+) -> void {
+    if err == Error::HttpStatus {
+        if status > 0 {
+            out.append_bytes(allocator, "HTTP ") catch return;
+            fmt::append_i64(allocator, out, status) catch return;
+        } else {
+            out.append_bytes(allocator, "unexpected HTTP status") catch return;
+        }
+        return;
+    }
+    if err == Error::NetworkFailed {
+        out.append_bytes(allocator, "TLS / network error") catch return;
+        return;
+    }
+    if err == Error::TooManyRedirects {
+        out.append_bytes(allocator, "too many redirects") catch return;
+        return;
+    }
+    if err == Error::InsecureRedirect {
+        out.append_bytes(allocator, "insecure redirect (https -> http)") catch return;
+        return;
+    }
+    if err == Error::NoTrustedRoots {
+        out.append_bytes(allocator, "no trusted CA certificates found") catch return;
+        return;
+    }
+    if err == Error::InvalidUrl {
+        out.append_bytes(allocator, "invalid URL") catch return;
+        return;
+    }
+    if err == Error::IoFailed {
+        out.append_bytes(allocator, "local I/O error") catch return;
+        return;
+    }
+    out.append_bytes(allocator, "out of memory") catch return;
+    return;
+}
+
+fn client_limits() -> http::Limits {
+    var limits = http::default_limits();
+    limits.max_head_bytes = 32768;
+    limits.max_headers = 128;
+    limits.read_head_millis = 30000;
+    limits.read_body_millis = 300000;
+    limits.write_millis = 30000;
+    return limits;
+}
+
+fn starts_with_ascii_fold(text: []u8, prefix: []u8) -> bool {
+    let plen = mem::len(prefix);
+    if mem::len(text) < plen {
+        return false;
+    }
+    return http::equal_ascii_fold(text[0..plen], prefix);
+}
+
+fn append_pem_roots(
+    allocator: Allocator,
+    pem_bytes: []u8,
+    roots: &var array::Array<string::String>,
+) -> Error!void {
+    var from: i64 = 0;
+    while x509::next_pem_block(pem_bytes, from) |block| {
+        let label = block.label(pem_bytes);
+        if mem::equal_bytes(label, "CERTIFICATE") {
+            if x509::decode_pem_block(allocator, pem_bytes, &block) |der| {
+                roots.append(allocator, move der) catch return Error::OutOfMemory;
+            } else |_| {}
+        }
+        from = block.next;
+    }
+    return;
+}
+
+fn try_load_ca_file(
+    handle: Io,
+    allocator: Allocator,
+    ca_path: []u8,
+    roots: &var array::Array<string::String>,
+) -> Error!bool {
+    if fs::read_file(handle, allocator, ca_path, mem::Limit::Bytes(16777216)) |pem| {
+        defer pem.deinit(allocator);
+        let pb = pem.as_bytes();
+        try append_pem_roots(allocator, pb, roots);
+        return roots.len() > 0;
+    } else |_| {
+        return false;
+    }
+}
+
+fn load_ca_roots_with_override(
+    handle: Io,
+    allocator: Allocator,
+    env_ca: []u8,
+    roots: &var array::Array<string::String>,
+    out_env_ca_used: &var bool,
+) -> Error!void {
+    out_env_ca_used.* = false;
+    if mem::len(env_ca) > 0 {
+        if try try_load_ca_file(handle, allocator, env_ca, roots) {
+            out_env_ca_used.* = true;
+            return;
+        }
+        return Error::NoTrustedRoots;
+    }
+    comptime if std::target::is_darwin() {
+        if try try_load_ca_file(handle, allocator, "/etc/ssl/cert.pem", roots) {
+            return;
+        }
+    } else {
+        if try try_load_ca_file(handle, allocator, "/etc/ssl/certs/ca-certificates.crt", roots) {
+            return;
+        }
+        if try try_load_ca_file(handle, allocator, "/etc/pki/tls/certs/ca-bundle.crt", roots) {
+            return;
+        }
+        if try try_load_ca_file(handle, allocator, "/etc/ssl/ca-bundle.pem", roots) {
+            return;
+        }
+        if try try_load_ca_file(handle, allocator, "/etc/ssl/cert.pem", roots) {
+            return;
+        }
+    }
+    return Error::NoTrustedRoots;
+}
+
+pub fn load_system_ca_roots(
+    handle: Io,
+    allocator: Allocator,
+    roots: &var array::Array<string::String>,
+) -> Error!void {
+    var used_env = false;
+    let env_ca = process::env("SSL_CERT_FILE") orelse "";
+    return load_ca_roots_with_override(handle, allocator, env_ca, roots, &var used_env);
+}
+
+fn is_redirect_status(status: i64) -> bool {
+    return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
+}
+
+fn resolve_redirect_url(
+    allocator: Allocator,
+    base: &http::Url,
+    location: []u8,
+    out: &var string::String,
+) -> Error!void {
+    let trimmed = mem::trim_ascii(location);
+    if mem::len(trimmed) == 0 {
+        return Error::InvalidUrl;
+    }
+    if starts_with_ascii_fold(trimmed, "https://") or starts_with_ascii_fold(trimmed, "http://") {
+        out.append_bytes(allocator, trimmed) catch return Error::OutOfMemory;
+        return;
+    }
+    let scheme = base.scheme.as_bytes();
+    if mem::starts_with(trimmed, "//") {
+        out.append_bytes(allocator, scheme) catch return Error::OutOfMemory;
+        out.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
+        out.append_bytes(allocator, trimmed) catch return Error::OutOfMemory;
+        return;
+    }
+    out.append_bytes(allocator, scheme) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, "://") catch return Error::OutOfMemory;
+    let host = base.host.as_bytes();
+    if bytes::index_of_byte(host, cast<u8>(58), 0) |_| {
+        out.append_byte(allocator, cast<u8>(91)) catch return Error::OutOfMemory;
+        out.append_bytes(allocator, host) catch return Error::OutOfMemory;
+        out.append_byte(allocator, cast<u8>(93)) catch return Error::OutOfMemory;
+    } else {
+        out.append_bytes(allocator, host) catch return Error::OutOfMemory;
+    }
+    let default_port: i64 = if base.secure { 443 } else { 80 };
+    if base.port != default_port {
+        out.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
+        fmt::append_i64(allocator, out, base.port) catch return Error::OutOfMemory;
+    }
+    if trimmed[0] == cast<u8>(47) {
+        out.append_bytes(allocator, trimmed) catch return Error::OutOfMemory;
+    } else {
+        let base_target = base.target.as_bytes();
+        var slash_end: i64 = 0;
+        if bytes::last_index_of_byte(base_target, cast<u8>(47)) |idx| {
+            slash_end = idx + 1;
+        }
+        if slash_end > 0 {
+            out.append_bytes(allocator, base_target[0..slash_end]) catch return Error::OutOfMemory;
+        } else {
+            out.append_byte(allocator, cast<u8>(47)) catch return Error::OutOfMemory;
+        }
+        out.append_bytes(allocator, trimmed) catch return Error::OutOfMemory;
+    }
+    return;
+}
+
+fn open_url_connection(
+    handle: Io,
+    allocator: Allocator,
+    parsed: &http::Url,
+    roots: &var array::Array<string::String>,
+    roots_loaded: &var bool,
+    used_env_ca: &var bool,
+    limits: http::Limits,
+) -> Error!http::Connection {
+    var addr = string::new(allocator);
+    defer addr.deinit(allocator);
+    parsed.authority(allocator, &var addr) catch return Error::InvalidUrl;
+    let addr_bytes = addr.as_bytes();
+    if parsed.secure {
+        if !roots_loaded.* {
+            let env_ca = process::env("SSL_CERT_FILE") orelse "";
+            try load_ca_roots_with_override(handle, allocator, env_ca, roots, used_env_ca);
+            roots_loaded.* = true;
+        }
+        let host_bytes = parsed.host.as_bytes();
+        let conn = http::connect_secure(handle, allocator, addr_bytes, host_bytes, roots, limits) catch return Error::NetworkFailed;
+        return move conn;
+    }
+    let conn = http::connect(handle, allocator, addr_bytes, limits) catch return Error::NetworkFailed;
+    return move conn;
+}
+
+fn finish_native_response(
+    handle: Io,
+    allocator: Allocator,
+    parsed: &http::Url,
+    conn: &var http::Connection,
+    resp: &http::ClientResponse,
+    dest_path: []u8,
+    hops: i64,
+    out_next_url: &var string::String,
+    out_sha256: &var string::String,
+    out_status: &var i64,
+) -> Error!HopOutcome {
+    out_status.* = resp.status;
+
+    if is_redirect_status(resp.status) {
+        if hops == 10 {
+            return Error::TooManyRedirects;
+        }
+        out_next_url.clear();
+        if resp.headers.find("location") |loc_field| {
+            let loc_bytes = loc_field.value.as_bytes();
+            try resolve_redirect_url(allocator, parsed, loc_bytes, out_next_url);
+        } else {
+            return Error::InvalidUrl;
+        }
+        let next_bytes = out_next_url.as_bytes();
+        if parsed.secure and !starts_with_ascii_fold(next_bytes, "https://") {
+            return Error::InsecureRedirect;
+        }
+        return HopOutcome::Redirect;
+    }
+
+    if resp.status != 200 {
+        return Error::HttpStatus;
+    }
+
+    let fd = posix::open_write_trunc(allocator, dest_path) catch return Error::IoFailed;
+    var hasher = hash::stream_new();
+    var chunk = string::new(allocator);
+    defer chunk.deinit(allocator);
+
+    while true {
+        chunk.clear();
+        var got: i64 = 0;
+        if conn.read_into(handle, allocator, &var chunk, 16384) |n| {
+            got = n;
+        } else |_| {
+            posix::close_fd(fd);
+            let _ = posix::unlink_if_exists(allocator, dest_path);
+            return Error::NetworkFailed;
+        }
+        if got == 0 {
+            break;
+        }
+        let cb = chunk.as_bytes();
+        if posix::write_all_fd(fd, cb) {} else |_| {
+            posix::close_fd(fd);
+            let _ = posix::unlink_if_exists(allocator, dest_path);
+            return Error::IoFailed;
+        }
+        hash::stream_update(&var hasher, cb);
+    }
+
+    posix::close_fd(fd);
+    out_sha256.clear();
+    if hash::stream_finish_hex(allocator, &var hasher, out_sha256) {} else |_| {
+        let _ = posix::unlink_if_exists(allocator, dest_path);
+        return Error::OutOfMemory;
+    }
+    return HopOutcome::Done;
+}
+
+fn try_native_hop(
+    handle: Io,
+    allocator: Allocator,
+    parsed: &http::Url,
+    headers: &http::Headers,
+    roots: &var array::Array<string::String>,
+    roots_loaded: &var bool,
+    used_env_ca: &var bool,
+    limits: http::Limits,
+    dest_path: []u8,
+    hops: i64,
+    out_next_url: &var string::String,
+    out_sha256: &var string::String,
+    out_status: &var i64,
+) -> Error!HopOutcome {
+    if open_url_connection(handle, allocator, parsed, roots, roots_loaded, used_env_ca, limits) |opened| {
+        var conn = move opened;
+        defer conn.deinit(allocator);
+
+        if conn.send_with(handle, allocator, "GET", parsed, headers, "", limits.write_millis) {} else |_| {
+            if parsed.secure {
+                return HopOutcome::FallbackCurl;
+            }
+            return Error::NetworkFailed;
+        }
+        if conn.receive(handle, allocator, "GET", limits) |received| {
+            var resp = move received;
+            defer resp.deinit(allocator);
+            return finish_native_response(
+                handle,
+                allocator,
+                parsed,
+                &var conn,
+                &resp,
+                dest_path,
+                hops,
+                out_next_url,
+                out_sha256,
+                out_status,
+            );
+        } else |_| {
+            if parsed.secure {
+                return HopOutcome::FallbackCurl;
+            }
+            return Error::NetworkFailed;
+        }
+    } else |err| {
+        if parsed.secure and err == Error::NetworkFailed {
+            return HopOutcome::FallbackCurl;
+        }
+        return err;
+    }
+}
+
+fn append_arg(
+    allocator: Allocator,
+    args: &var array::Array<string::String>,
+    val: []u8,
+) -> Error!void {
+    let owned = string::from_bytes(allocator, val) catch return Error::OutOfMemory;
+    args.append(allocator, move owned) catch return Error::OutOfMemory;
+    return;
+}
+
+fn parse_curl_http_status(stdout_bytes: []u8) -> i64 {
+    let trimmed = mem::trim_ascii(stdout_bytes);
+    return bytes::parse_nonneg_i64(trimmed) orelse 0;
+}
+
+fn map_curl_result(rc: i64, stdout_bytes: []u8, out_status: &var i64) -> Error!void {
+    let status = parse_curl_http_status(stdout_bytes);
+    if rc == 0 {
+        out_status.* = status;
+        if status != 200 {
+            return Error::HttpStatus;
+        }
+        return;
+    }
+    if rc == 47 {
+        out_status.* = status;
+        return Error::TooManyRedirects;
+    }
+    if rc == 1 and is_redirect_status(status) {
+        out_status.* = status;
+        return Error::InsecureRedirect;
+    }
+    if rc == 22 {
+        out_status.* = status;
+        if status > 0 {
+            return Error::HttpStatus;
+        }
+        return Error::NetworkFailed;
+    }
+    if rc == 23 {
+        out_status.* = status;
+        return Error::IoFailed;
+    }
+    out_status.* = 0;
+    return Error::NetworkFailed;
+}
+
+fn download_via_curl(
+    allocator: Allocator,
+    url: []u8,
+    dest_path: []u8,
+    max_redirs: i64,
+    ca_file: []u8,
+    out_sha256: &var string::String,
+    out_status: &var i64,
+) -> Error!void {
+    if !starts_with_ascii_fold(url, "https://") {
+        return Error::InsecureRedirect;
+    }
+    out_status.* = 0;
+
+    var redirs_str = string::new(allocator);
+    defer redirs_str.deinit(allocator);
+    var clamped_redirs = max_redirs;
+    if clamped_redirs < 0 {
+        clamped_redirs = 0;
+    }
+    fmt::append_i64(allocator, &var redirs_str, clamped_redirs) catch return Error::OutOfMemory;
+    let redirs_b = redirs_str.as_bytes();
+
+    var args = array::new<string::String>(allocator);
+    defer args.deinit(allocator);
+    try append_arg(allocator, &var args, "curl");
+    try append_arg(allocator, &var args, "-fsSL");
+    try append_arg(allocator, &var args, "--proto");
+    try append_arg(allocator, &var args, "=https");
+    try append_arg(allocator, &var args, "--proto-redir");
+    try append_arg(allocator, &var args, "=https");
+    try append_arg(allocator, &var args, "--max-redirs");
+    try append_arg(allocator, &var args, redirs_b);
+    try append_arg(allocator, &var args, "--connect-timeout");
+    try append_arg(allocator, &var args, "30");
+    try append_arg(allocator, &var args, "--user-agent");
+    try append_arg(allocator, &var args, "kugi/0.1.0");
+    if mem::len(ca_file) > 0 {
+        try append_arg(allocator, &var args, "--cacert");
+        try append_arg(allocator, &var args, ca_file);
+    }
+    try append_arg(allocator, &var args, "-w");
+    try append_arg(allocator, &var args, "%{http_code}");
+    try append_arg(allocator, &var args, "-o");
+    try append_arg(allocator, &var args, dest_path);
+    try append_arg(allocator, &var args, "--");
+    try append_arg(allocator, &var args, url);
+
+    let init_fd = posix::open_write_trunc(allocator, dest_path) catch return Error::IoFailed;
+    posix::close_fd(init_fd);
+
+    var stdout = string::new(allocator);
+    defer stdout.deinit(allocator);
+    var rc: i64 = 0;
+    if posix::spawn_capture_stdout(allocator, &args, &var stdout) |code| {
+        rc = code;
+    } else |err| {
+        let _ = posix::unlink_if_exists(allocator, dest_path);
+        if err == posix::Error::OutOfMemory {
+            return Error::OutOfMemory;
+        }
+        return Error::NetworkFailed;
+    }
+
+    let stdout_b = stdout.as_bytes();
+    if map_curl_result(rc, stdout_b, out_status) {} else |err| {
+        let _ = posix::unlink_if_exists(allocator, dest_path);
+        return err;
+    }
+
+    out_sha256.clear();
+    if posix::hash_file_sha256(allocator, dest_path, out_sha256) {} else |err| {
+        let _ = posix::unlink_if_exists(allocator, dest_path);
+        if err == posix::Error::OutOfMemory {
+            return Error::OutOfMemory;
+        }
+        return Error::IoFailed;
+    }
+    return;
+}
+
+pub fn download_to_file(
+    handle: Io,
+    allocator: Allocator,
+    url: []u8,
+    dest_path: []u8,
+    out_sha256: &var string::String,
+    out_status: &var i64,
+) -> Error!void {
+    out_status.* = 0;
+    let limits = client_limits();
+    var current_url = string::from_bytes(allocator, url) catch return Error::OutOfMemory;
+    defer current_url.deinit(allocator);
+    var roots = array::new<string::String>(allocator);
+    defer roots.deinit(allocator);
+    var roots_loaded = false;
+    var used_env_ca = false;
+
+    var headers = http::headers_new(allocator);
+    defer headers.deinit(allocator);
+    headers.add(allocator, "User-Agent", "kugi/0.1.0") catch return Error::OutOfMemory;
+    headers.add(allocator, "Accept", "*/*") catch return Error::OutOfMemory;
+
+    var hops = 0;
+    while hops <= 10 {
+        let cur_bytes = current_url.as_bytes();
+        var parsed = http::parse_url(allocator, cur_bytes) catch return Error::InvalidUrl;
+        defer parsed.deinit(allocator);
+
+        var next_url = string::new(allocator);
+        defer next_url.deinit(allocator);
+        let outcome = try try_native_hop(
+            handle,
+            allocator,
+            &parsed,
+            &headers,
+            &var roots,
+            &var roots_loaded,
+            &var used_env_ca,
+            limits,
+            dest_path,
+            hops,
+            &var next_url,
+            out_sha256,
+            out_status,
+        );
+        if outcome == HopOutcome::Done {
+            return;
+        }
+        if outcome == HopOutcome::FallbackCurl {
+            var ca_file: []u8 = "";
+            if used_env_ca {
+                ca_file = process::env("SSL_CERT_FILE") orelse "";
+            }
+            return download_via_curl(
+                allocator,
+                cur_bytes,
+                dest_path,
+                10 - hops,
+                ca_file,
+                out_sha256,
+                out_status,
+            );
+        }
+        let next_bytes = next_url.as_bytes();
+        current_url.clear();
+        current_url.append_bytes(allocator, next_bytes) catch return Error::OutOfMemory;
+        hops = hops + 1;
+    }
+    return Error::TooManyRedirects;
+}
+
+struct MockServerState {
+    server: http::Server,
+    requests_handled: i64,
+    max_requests: i64,
+}
+
+fn (self: MockServerState) deinit(allocator: Allocator) -> void {
+    self.server.deinit(allocator);
+    return;
+}
+
+fn mock_server_worker(handle: Io, allocator: Allocator, state: &var MockServerState) -> void {
+    var count = 0;
+    while count < state.max_requests {
+        var ex = state.server.accept(handle, allocator, 65536) catch return;
+        defer ex.deinit(allocator);
+        let target = ex.request.target.as_bytes();
+        let is_redir = mem::equal_bytes(target, "/redirect");
+        let is_art = mem::equal_bytes(target, "/artifact.bin");
+        let is_loop = mem::equal_bytes(target, "/loop");
+        let is_boom = mem::equal_bytes(target, "/boom");
+        if is_redir {
+            ex.response.set_status(302) catch return;
+            ex.response.header(allocator, "Location", "/artifact.bin") catch return;
+            ex.respond(handle, allocator) catch return;
+        } else if is_art {
+            ex.response.set_status(200) catch return;
+            ex.response.write(allocator, "hello-kugi-artifact") catch return;
+            ex.respond(handle, allocator) catch return;
+        } else if is_loop {
+            ex.response.set_status(302) catch return;
+            ex.response.header(allocator, "Location", "/loop") catch return;
+            ex.respond(handle, allocator) catch return;
+        } else if is_boom {
+            ex.response.set_status(500) catch return;
+            ex.response.write(allocator, "internal error") catch return;
+            ex.respond(handle, allocator) catch return;
+        } else {
+            ex.response.set_status(404) catch return;
+            ex.response.write(allocator, "missing") catch return;
+            ex.respond(handle, allocator) catch return;
+        }
+        state.requests_handled = state.requests_handled + 1;
+        count = count + 1;
+    }
+    return;
+}
+
+struct MockClientState {
+    port: i64,
+    base_dir: string::String,
+    ok_download: bool,
+    ok_404: bool,
+    ok_500: bool,
+    ok_loop: bool,
+    status_1: i64,
+    status_2: i64,
+    status_3: i64,
+    sha_1: string::String,
+}
+
+fn (self: MockClientState) deinit(allocator: Allocator) -> void {
+    self.base_dir.deinit(allocator);
+    self.sha_1.deinit(allocator);
+    return;
+}
+
+fn build_local_url(allocator: Allocator, port: i64, path_part: []u8, out: &var string::String) -> void {
+    out.clear();
+    out.append_bytes(allocator, "http://127.0.0.1:") catch return;
+    fmt::append_i64(allocator, out, port) catch return;
+    out.append_bytes(allocator, path_part) catch return;
+    return;
+}
+
+fn mock_client_worker(handle: Io, allocator: Allocator, state: &var MockClientState) -> void {
+    let base_bytes = state.base_dir.as_bytes();
+    var url_buf = string::new(allocator);
+    defer url_buf.deinit(allocator);
+    var sha = string::new(allocator);
+    defer sha.deinit(allocator);
+
+    build_local_url(allocator, state.port, "/redirect", &var url_buf);
+    let redir_b = url_buf.as_bytes();
+    var dest = path::join(allocator, base_bytes, "out.part") catch return;
+    defer dest.deinit(allocator);
+    let dest_b = dest.as_bytes();
+    var status1: i64 = 0;
+    if download_to_file(handle, allocator, redir_b, dest_b, &var sha, &var status1) {
+        state.ok_download = true;
+        state.status_1 = status1;
+        let sb = sha.as_bytes();
+        state.sha_1.append_bytes(allocator, sb) catch return;
+    } else |_| {
+        state.status_1 = status1;
+    }
+
+    build_local_url(allocator, state.port, "/missing", &var url_buf);
+    let miss_b = url_buf.as_bytes();
+    var miss_dest = path::join(allocator, base_bytes, "miss.part") catch return;
+    defer miss_dest.deinit(allocator);
+    let mdb = miss_dest.as_bytes();
+    var status2: i64 = 0;
+    if download_to_file(handle, allocator, miss_b, mdb, &var sha, &var status2) {
+        state.ok_404 = false;
+    } else |err| {
+        state.ok_404 = err == Error::HttpStatus;
+        state.status_2 = status2;
+    }
+
+    build_local_url(allocator, state.port, "/boom", &var url_buf);
+    let boom_b = url_buf.as_bytes();
+    var boom_dest = path::join(allocator, base_bytes, "boom.part") catch return;
+    defer boom_dest.deinit(allocator);
+    let bdb = boom_dest.as_bytes();
+    var status3: i64 = 0;
+    if download_to_file(handle, allocator, boom_b, bdb, &var sha, &var status3) {
+        state.ok_500 = false;
+    } else |err| {
+        state.ok_500 = err == Error::HttpStatus;
+        state.status_3 = status3;
+    }
+
+    build_local_url(allocator, state.port, "/loop", &var url_buf);
+    let loop_b = url_buf.as_bytes();
+    var loop_dest = path::join(allocator, base_bytes, "loop.part") catch return;
+    defer loop_dest.deinit(allocator);
+    let ldb = loop_dest.as_bytes();
+    var status4: i64 = 0;
+    if download_to_file(handle, allocator, loop_b, ldb, &var sha, &var status4) {
+        state.ok_loop = false;
+    } else |err| {
+        state.ok_loop = err == Error::TooManyRedirects;
+    }
+    return;
+}
+
+test "fetch redirect download 404 500 and redirect-limit handling over loopback" {
+    let allocator = mem::page_allocator();
+    if io::loop_new() |ev_val| {
+        var ev_loop = move ev_val;
+        defer ev_loop.deinit();
+        let handle = io::evented(&var ev_loop);
+
+        if http::listen(handle, allocator, "127.0.0.1:0") |srv_val| {
+            var server = move srv_val;
+            let port = server.local_port() catch 0;
+            testing::expect(port > 0);
+            var srv_state = MockServerState {
+                server: move server,
+                requests_handled: 0,
+                max_requests: 15,
+            };
+            defer srv_state.deinit(allocator);
+
+            var base = string::new(allocator);
+            defer base.deinit(allocator);
+            let tmp_root = process::env("TMPDIR") orelse "/tmp";
+            base.append_bytes(allocator, tmp_root) catch return;
+            base.append_bytes(allocator, "/kugi-fetch-test-") catch return;
+            fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+            base.append_bytes(allocator, "-") catch return;
+            fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+            let base_bytes = base.as_bytes();
+            let _ = posix::create_dir_all(handle, allocator, base_bytes);
+
+            var base_copy = string::from_bytes(allocator, base_bytes) catch return;
+            var cli_state = MockClientState {
+                port: port,
+                base_dir: move base_copy,
+                ok_download: false,
+                ok_404: false,
+                ok_500: false,
+                ok_loop: false,
+                status_1: 0,
+                status_2: 0,
+                status_3: 0,
+                sha_1: string::new(allocator),
+            };
+            defer cli_state.deinit(allocator);
+
+            if io::async<MockServerState>(handle, allocator, mock_server_worker, &var srv_state) |sf_val| {
+                var srv_fut = move sf_val;
+                defer srv_fut.deinit(allocator);
+                if io::async<MockClientState>(handle, allocator, mock_client_worker, &var cli_state) |cf_val| {
+                    var cli_fut = move cf_val;
+                    defer cli_fut.deinit(allocator);
+                    cli_fut.await();
+                    srv_fut.await();
+                } else |_| {
+                    testing::fail("async client failed");
+                }
+            } else |_| {
+                testing::fail("async server failed");
+            }
+
+            testing::expect(cli_state.ok_download);
+            testing::expect_equal<i64>(200, cli_state.status_1);
+            var expected = string::new(allocator);
+            defer expected.deinit(allocator);
+            hash::sha256_hex(allocator, "hello-kugi-artifact", &var expected) catch return;
+            let sb = cli_state.sha_1.as_bytes();
+            let eb = expected.as_bytes();
+            testing::expect_equal<[]u8>(eb, sb);
+            testing::expect(cli_state.ok_404);
+            testing::expect_equal<i64>(404, cli_state.status_2);
+            testing::expect(cli_state.ok_500);
+            testing::expect_equal<i64>(500, cli_state.status_3);
+            testing::expect(cli_state.ok_loop);
+            let _ = posix::remove_tree(handle, allocator, base_bytes);
+        } else |_| {
+            testing::fail("http listen failed");
+        }
+    } else |_| {
+        testing::fail("loop_new failed");
+    }
+}
+
+fn expect_reason(allocator: Allocator, err: Error, status: i64, expected: []u8) -> void {
+    var buf = string::new(allocator);
+    defer buf.deinit(allocator);
+    format_error_reason(allocator, err, status, &var buf);
+    let actual = buf.as_bytes();
+    testing::expect_equal<[]u8>(expected, actual);
+    return;
+}
+
+test "format_error_reason covers all fetch failure diagnostics" {
+    let allocator = mem::page_allocator();
+    expect_reason(allocator, Error::HttpStatus, 404, "HTTP 404");
+    expect_reason(allocator, Error::HttpStatus, 403, "HTTP 403");
+    expect_reason(allocator, Error::HttpStatus, 500, "HTTP 500");
+    expect_reason(allocator, Error::NetworkFailed, 0, "TLS / network error");
+    expect_reason(allocator, Error::TooManyRedirects, 302, "too many redirects");
+    expect_reason(allocator, Error::InsecureRedirect, 302, "insecure redirect (https -> http)");
+    expect_reason(allocator, Error::NoTrustedRoots, 0, "no trusted CA certificates found");
+    expect_reason(allocator, Error::InvalidUrl, 0, "invalid URL");
+    expect_reason(allocator, Error::IoFailed, 0, "local I/O error");
+}
+
+test "map_curl_result classifies status redirects downgrade and network failures" {
+    var status: i64 = 0;
+
+    if map_curl_result(0, "200", &var status) {
+        testing::expect_equal<i64>(200, status);
+    } else |_| {
+        testing::fail("200 should succeed");
+    }
+
+    if map_curl_result(0, "204", &var status) {
+        testing::fail("non-200 status should fail");
+    } else |err| {
+        testing::expect(err == Error::HttpStatus);
+        testing::expect_equal<i64>(204, status);
+    }
+
+    if map_curl_result(22, "404", &var status) {
+        testing::fail("curl 22 should fail");
+    } else |err| {
+        testing::expect(err == Error::HttpStatus);
+        testing::expect_equal<i64>(404, status);
+    }
+
+    let allocator = mem::page_allocator();
+    var status_nl = string::from_bytes(allocator, "500") catch return;
+    defer status_nl.deinit(allocator);
+    status_nl.append_byte(allocator, cast<u8>(10)) catch return;
+    let status_nl_b = status_nl.as_bytes();
+    if map_curl_result(22, status_nl_b, &var status) {
+        testing::fail("curl 22 500 should fail");
+    } else |err| {
+        testing::expect(err == Error::HttpStatus);
+        testing::expect_equal<i64>(500, status);
+    }
+
+    if map_curl_result(47, "302", &var status) {
+        testing::fail("curl 47 should fail");
+    } else |err| {
+        testing::expect(err == Error::TooManyRedirects);
+    }
+
+    if map_curl_result(1, "302", &var status) {
+        testing::fail("curl 1 on redirect should fail");
+    } else |err| {
+        testing::expect(err == Error::InsecureRedirect);
+    }
+
+    if map_curl_result(60, "000", &var status) {
+        testing::fail("curl 60 should fail");
+    } else |err| {
+        testing::expect(err == Error::NetworkFailed);
+        testing::expect_equal<i64>(0, status);
+    }
+
+    if map_curl_result(23, "200", &var status) {
+        testing::fail("curl 23 should fail");
+    } else |err| {
+        testing::expect(err == Error::IoFailed);
+    }
+}
+
+test "download_via_curl refuses non-https URLs" {
+    let allocator = mem::page_allocator();
+    var sha = string::new(allocator);
+    defer sha.deinit(allocator);
+    var status: i64 = 0;
+    if download_via_curl(allocator, "http://127.0.0.1:9/file", "/tmp/kugi-should-not-create", 10, "", &var sha, &var status) {
+        testing::fail("http URL must be refused by curl fallback");
+    } else |err| {
+        testing::expect(err == Error::InsecureRedirect);
+    }
+}
+
+test "resolve_redirect_url and scheme downgrade checks handle mixed case" {
+    let allocator = mem::page_allocator();
+    if http::parse_url(allocator, "https://example.com/releases/tool.tgz") |parsed_val| {
+        var parsed = move parsed_val;
+        defer parsed.deinit(allocator);
+
+        var out = string::new(allocator);
+        defer out.deinit(allocator);
+        if resolve_redirect_url(allocator, &parsed, "HTTP://insecure.example.com/tool.tgz", &var out) {
+            let next_b = out.as_bytes();
+            testing::expect_equal<[]u8>("HTTP://insecure.example.com/tool.tgz", next_b);
+            testing::expect(!starts_with_ascii_fold(next_b, "https://"));
+        } else |_| {
+            testing::fail("resolve_redirect_url failed for HTTP://");
+        }
+
+        out.clear();
+        if resolve_redirect_url(allocator, &parsed, "HTTPS://cdn.example.com/tool.tgz", &var out) {
+            let next_b = out.as_bytes();
+            testing::expect(starts_with_ascii_fold(next_b, "https://"));
+        } else |_| {
+            testing::fail("resolve_redirect_url failed for HTTPS://");
+        }
+
+        out.clear();
+        if resolve_redirect_url(allocator, &parsed, "//cdn.example.com/tool.tgz", &var out) {
+            let next_b = out.as_bytes();
+            testing::expect_equal<[]u8>("https://cdn.example.com/tool.tgz", next_b);
+        } else |_| {
+            testing::fail("resolve_redirect_url failed for scheme-relative URL");
+        }
+    } else |_| {
+        testing::fail("parse_url failed");
+    }
+}
+
+test "system CA root loader parses PEM bundle and rejects broken override" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var roots = array::new<string::String>(allocator);
+    defer roots.deinit(allocator);
+    if load_system_ca_roots(handle, allocator, &var roots) {
+        testing::expect(roots.len() > 0);
+    } else |_| {
+        testing::fail("load_system_ca_roots failed on host");
+    }
+
+    var empty_roots = array::new<string::String>(allocator);
+    defer empty_roots.deinit(allocator);
+    var used_env = false;
+    if load_ca_roots_with_override(handle, allocator, "/nonexistent/kugi-missing-ca.pem", &var empty_roots, &var used_env) {
+        testing::fail("explicit missing SSL_CERT_FILE must return NoTrustedRoots");
+    } else |err| {
+        testing::expect(err == Error::NoTrustedRoots);
+        testing::expect(!used_env);
+    }
+}

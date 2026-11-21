@@ -1,0 +1,1901 @@
+import kugi::bytes;
+import std::array;
+import std::fmt;
+import std::map;
+import std::mem;
+import std::path;
+import std::string;
+import std::testing;
+
+pub error Error {
+    Syntax,
+    Validation,
+    OutOfMemory,
+}
+
+pub enum ExtractMode {
+    Bin,
+    All,
+}
+
+pub enum InstallMode {
+    Store,
+    Bootstrap,
+}
+
+pub enum ArchiveMode {
+    Auto,
+    None,
+}
+
+pub struct BinSpec {
+    pub source: string::String,
+    pub dest: string::String,
+}
+
+pub fn (self: BinSpec) deinit(allocator: Allocator) -> void {
+    self.source.deinit(allocator);
+    self.dest.deinit(allocator);
+    return;
+}
+
+pub struct ToolSpec {
+    pub name: string::String,
+    pub version: string::String,
+    pub has_url: bool,
+    pub url: string::String,
+    pub has_github: bool,
+    pub github: string::String,
+    pub has_asset: bool,
+    pub asset: string::String,
+    pub has_tag: bool,
+    pub tag: string::String,
+    pub bins: array::Array<BinSpec>,
+    pub os_map: map::Map<[]u8, string::String>,
+    pub arch_map: map::Map<[]u8, string::String>,
+    pub extract: ExtractMode,
+    pub mode: InstallMode,
+    pub archive: ArchiveMode,
+    pub has_install_dir: bool,
+    pub install_dir: string::String,
+    pub has_sha256: bool,
+    pub sha256: string::String,
+}
+
+pub fn (self: ToolSpec) deinit(allocator: Allocator) -> void {
+    self.name.deinit(allocator);
+    self.version.deinit(allocator);
+    self.url.deinit(allocator);
+    self.github.deinit(allocator);
+    self.asset.deinit(allocator);
+    self.tag.deinit(allocator);
+    self.bins.deinit(allocator);
+    self.os_map.deinit(allocator);
+    self.arch_map.deinit(allocator);
+    self.install_dir.deinit(allocator);
+    self.sha256.deinit(allocator);
+    return;
+}
+
+pub struct AssetSpec {
+    pub name: string::String,
+    pub version: string::String,
+    pub has_url: bool,
+    pub url: string::String,
+    pub has_github: bool,
+    pub github: string::String,
+    pub has_asset: bool,
+    pub asset: string::String,
+    pub has_tag: bool,
+    pub tag: string::String,
+    pub os_map: map::Map<[]u8, string::String>,
+    pub arch_map: map::Map<[]u8, string::String>,
+    pub archive: ArchiveMode,
+    pub has_archive: bool,
+    pub unwrap: bool,
+    pub has_unwrap: bool,
+    pub has_sha256: bool,
+    pub sha256: string::String,
+}
+
+pub fn (self: AssetSpec) deinit(allocator: Allocator) -> void {
+    self.name.deinit(allocator);
+    self.version.deinit(allocator);
+    self.url.deinit(allocator);
+    self.github.deinit(allocator);
+    self.asset.deinit(allocator);
+    self.tag.deinit(allocator);
+    self.os_map.deinit(allocator);
+    self.arch_map.deinit(allocator);
+    self.sha256.deinit(allocator);
+    return;
+}
+
+pub struct StoreConfig {
+    pub has_max_size: bool,
+    pub max_size_bytes: i64,
+}
+
+pub struct Manifest {
+    pub store: StoreConfig,
+    pub tools: array::Array<ToolSpec>,
+    pub assets: array::Array<AssetSpec>,
+    pub env: map::Map<[]u8, string::String>,
+    pub links: map::Map<[]u8, string::String>,
+}
+
+pub fn (self: Manifest) deinit(allocator: Allocator) -> void {
+    self.tools.deinit(allocator);
+    self.assets.deinit(allocator);
+    self.env.deinit(allocator);
+    self.links.deinit(allocator);
+    return;
+}
+
+enum SectionKind {
+    None,
+    Store,
+    Tool,
+    Asset,
+    Env,
+    Links,
+}
+
+struct Cursor {
+    input: []u8,
+    pos: i64,
+    line: i64,
+}
+
+fn new_tool_spec(allocator: Allocator, name: []u8) -> Error!ToolSpec {
+    var owned_name = string::from_bytes(allocator, name) catch return Error::OutOfMemory;
+    errdefer owned_name.deinit(allocator);
+    return ToolSpec {
+        name: move owned_name,
+        version: string::new(allocator),
+        has_url: false,
+        url: string::new(allocator),
+        has_github: false,
+        github: string::new(allocator),
+        has_asset: false,
+        asset: string::new(allocator),
+        has_tag: false,
+        tag: string::new(allocator),
+        bins: array::new<BinSpec>(allocator),
+        os_map: map::new<[]u8, string::String>(allocator),
+        arch_map: map::new<[]u8, string::String>(allocator),
+        extract: ExtractMode::Bin,
+        mode: InstallMode::Store,
+        archive: ArchiveMode::Auto,
+        has_install_dir: false,
+        install_dir: string::new(allocator),
+        has_sha256: false,
+        sha256: string::new(allocator),
+    };
+}
+
+fn new_asset_spec(allocator: Allocator, name: []u8) -> Error!AssetSpec {
+    var owned_name = string::from_bytes(allocator, name) catch return Error::OutOfMemory;
+    errdefer owned_name.deinit(allocator);
+    return AssetSpec {
+        name: move owned_name,
+        version: string::new(allocator),
+        has_url: false,
+        url: string::new(allocator),
+        has_github: false,
+        github: string::new(allocator),
+        has_asset: false,
+        asset: string::new(allocator),
+        has_tag: false,
+        tag: string::new(allocator),
+        os_map: map::new<[]u8, string::String>(allocator),
+        arch_map: map::new<[]u8, string::String>(allocator),
+        archive: ArchiveMode::Auto,
+        has_archive: false,
+        unwrap: true,
+        has_unwrap: false,
+        has_sha256: false,
+        sha256: string::new(allocator),
+    };
+}
+
+fn set_diag(
+    allocator: Allocator,
+    diag: &var string::String,
+    line: i64,
+    message: []u8,
+) -> void {
+    diag.clear();
+    if line > 0 {
+        diag.append_bytes(allocator, "line ") catch return;
+        fmt::append_i64(allocator, diag, line) catch return;
+        diag.append_bytes(allocator, ": ") catch return;
+    }
+    diag.append_bytes(allocator, message) catch return;
+    return;
+}
+
+fn peek(cur: &Cursor) -> ?u8 {
+    if cur.pos >= mem::len(cur.input) {
+        return null;
+    }
+    return cur.input[cur.pos];
+}
+
+fn advance(cur: &var Cursor) -> ?u8 {
+    if cur.pos >= mem::len(cur.input) {
+        return null;
+    }
+    let b = cur.input[cur.pos];
+    cur.pos = cur.pos + 1;
+    if b == cast<u8>(10) {
+        cur.line = cur.line + 1;
+    }
+    return b;
+}
+
+fn skip_hspace(cur: &var Cursor) -> void {
+    while peek(cur) |b| {
+        if b == cast<u8>(32) or b == cast<u8>(9) {
+            let _ = advance(cur);
+        } else {
+            break;
+        }
+    }
+    return;
+}
+
+fn skip_ws_and_comments(cur: &var Cursor) -> void {
+    while peek(cur) |b| {
+        if b == cast<u8>(32) or b == cast<u8>(9) or b == cast<u8>(10) or b == cast<u8>(13) {
+            let _ = advance(cur);
+        } else if b == cast<u8>(35) {
+            while peek(cur) |cb| {
+                let _ = advance(cur);
+                if cb == cast<u8>(10) {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    return;
+}
+
+fn skip_line_tail(
+    allocator: Allocator,
+    cur: &var Cursor,
+    diag: &var string::String,
+) -> Error!void {
+    skip_hspace(cur);
+    if peek(cur) |b| {
+        if b == cast<u8>(35) {
+            while peek(cur) |cb| {
+                let _ = advance(cur);
+                if cb == cast<u8>(10) {
+                    break;
+                }
+            }
+            return;
+        }
+        if b == cast<u8>(13) {
+            let _ = advance(cur);
+            if peek(cur) |lf| {
+                if lf == cast<u8>(10) {
+                    let _ = advance(cur);
+                }
+            }
+            return;
+        }
+        if b == cast<u8>(10) {
+            let _ = advance(cur);
+            return;
+        }
+        set_diag(allocator, diag, cur.line, "unexpected trailing characters on line");
+        return Error::Syntax;
+    }
+    return;
+}
+
+fn is_bare_key_byte(b: u8) -> bool {
+    let is_upper = b >= cast<u8>(65) and b <= cast<u8>(90);
+    let is_lower = b >= cast<u8>(97) and b <= cast<u8>(122);
+    let is_digit = b >= cast<u8>(48) and b <= cast<u8>(57);
+    return is_upper or is_lower or is_digit or b == cast<u8>(45) or b == cast<u8>(95);
+}
+
+fn is_tool_name_byte(b: u8) -> bool {
+    return is_bare_key_byte(b) or b == cast<u8>(46);
+}
+
+fn parse_quoted_string(
+    allocator: Allocator,
+    cur: &var Cursor,
+    out: &var string::String,
+    diag: &var string::String,
+) -> Error!void {
+    if advance(cur) |quote| {
+        if quote != cast<u8>(34) {
+            set_diag(allocator, diag, cur.line, "expected opening quote");
+            return Error::Syntax;
+        }
+    } else {
+        set_diag(allocator, diag, cur.line, "expected quoted string");
+        return Error::Syntax;
+    }
+    while advance(cur) |b| {
+        if b == cast<u8>(34) {
+            return;
+        }
+        if b == cast<u8>(10) or b == cast<u8>(13) {
+            set_diag(allocator, diag, cur.line, "unterminated string literal");
+            return Error::Syntax;
+        }
+        if b == cast<u8>(92) {
+            if advance(cur) |esc| {
+                if esc == cast<u8>(34) {
+                    out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(92) {
+                    out.append_byte(allocator, cast<u8>(92)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(110) {
+                    out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(114) {
+                    out.append_byte(allocator, cast<u8>(13)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(116) {
+                    out.append_byte(allocator, cast<u8>(9)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(98) {
+                    out.append_byte(allocator, cast<u8>(8)) catch return Error::OutOfMemory;
+                } else if esc == cast<u8>(102) {
+                    out.append_byte(allocator, cast<u8>(12)) catch return Error::OutOfMemory;
+                } else {
+                    set_diag(allocator, diag, cur.line, "invalid escape sequence in string");
+                    return Error::Syntax;
+                }
+            } else {
+                set_diag(allocator, diag, cur.line, "unterminated escape sequence");
+                return Error::Syntax;
+            }
+        } else {
+            out.append_byte(allocator, b) catch return Error::OutOfMemory;
+        }
+    }
+    set_diag(allocator, diag, cur.line, "unterminated string literal");
+    return Error::Syntax;
+}
+
+fn parse_key(
+    allocator: Allocator,
+    cur: &var Cursor,
+    out: &var string::String,
+    diag: &var string::String,
+) -> Error!void {
+    skip_hspace(cur);
+    if peek(cur) |b| {
+        if b == cast<u8>(34) {
+            return parse_quoted_string(allocator, cur, out, diag);
+        }
+    } else {
+        set_diag(allocator, diag, cur.line, "expected key");
+        return Error::Syntax;
+    }
+    let start = cur.pos;
+    while peek(cur) |ch| {
+        if is_bare_key_byte(ch) {
+            let _ = advance(cur);
+        } else {
+            break;
+        }
+    }
+    if cur.pos == start {
+        set_diag(allocator, diag, cur.line, "expected key");
+        return Error::Syntax;
+    }
+    out.append_bytes(allocator, cur.input[start..cur.pos]) catch return Error::OutOfMemory;
+    return;
+}
+
+fn parse_string_array(
+    allocator: Allocator,
+    cur: &var Cursor,
+    out: &var array::Array<string::String>,
+    diag: &var string::String,
+) -> Error!void {
+    if advance(cur) |open| {
+        if open != cast<u8>(91) {
+            set_diag(allocator, diag, cur.line, "expected '[' for string array");
+            return Error::Syntax;
+        }
+    } else {
+        set_diag(allocator, diag, cur.line, "expected '['");
+        return Error::Syntax;
+    }
+    while true {
+        skip_ws_and_comments(cur);
+        if peek(cur) |next| {
+            if next == cast<u8>(93) {
+                let _ = advance(cur);
+                return;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "unterminated array");
+            return Error::Syntax;
+        }
+        var item = string::new(allocator);
+        errdefer item.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var item, diag);
+        out.append(allocator, move item) catch return Error::OutOfMemory;
+        skip_ws_and_comments(cur);
+        if peek(cur) |sep| {
+            if sep == cast<u8>(44) {
+                let _ = advance(cur);
+            } else if sep == cast<u8>(93) {
+                let _ = advance(cur);
+                return;
+            } else {
+                set_diag(allocator, diag, cur.line, "expected ',' or ']' in array");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "unterminated array");
+            return Error::Syntax;
+        }
+    }
+    return;
+}
+
+fn parse_inline_map(
+    allocator: Allocator,
+    cur: &var Cursor,
+    out: &var map::Map<[]u8, string::String>,
+    diag: &var string::String,
+) -> Error!void {
+    if advance(cur) |open| {
+        if open != cast<u8>(123) {
+            set_diag(allocator, diag, cur.line, "expected '{' for inline map");
+            return Error::Syntax;
+        }
+    } else {
+        set_diag(allocator, diag, cur.line, "expected '{'");
+        return Error::Syntax;
+    }
+    while true {
+        skip_hspace(cur);
+        if peek(cur) |next| {
+            if next == cast<u8>(125) {
+                let _ = advance(cur);
+                return;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "unterminated inline map");
+            return Error::Syntax;
+        }
+        var k = string::new(allocator);
+        defer k.deinit(allocator);
+        try parse_key(allocator, cur, &var k, diag);
+        skip_hspace(cur);
+        if advance(cur) |eq| {
+            if eq != cast<u8>(61) {
+                set_diag(allocator, diag, cur.line, "expected '=' in inline map");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected '=' in inline map");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        var v = string::new(allocator);
+        errdefer v.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var v, diag);
+        let k_bytes = k.as_bytes();
+        if out.contains(k_bytes) {
+            set_diag(allocator, diag, cur.line, "duplicate key in inline map");
+            return Error::Validation;
+        }
+        out.insert(allocator, k_bytes, move v) catch return Error::OutOfMemory;
+        skip_hspace(cur);
+        if peek(cur) |sep| {
+            if sep == cast<u8>(44) {
+                let _ = advance(cur);
+            } else if sep == cast<u8>(125) {
+                let _ = advance(cur);
+                return;
+            } else {
+                set_diag(allocator, diag, cur.line, "expected ',' or '}' in inline map");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "unterminated inline map");
+            return Error::Syntax;
+        }
+    }
+    return;
+}
+
+fn parse_bin_spec(
+    allocator: Allocator,
+    raw: []u8,
+    line: i64,
+    diag: &var string::String,
+) -> Error!BinSpec {
+    if mem::len(raw) == 0 {
+        set_diag(allocator, diag, line, "bin entry must not be empty");
+        return Error::Validation;
+    }
+    var src_slice = raw;
+    var dst_slice = path::basename(raw);
+    if bytes::index_of_byte(raw, cast<u8>(58), 0) |colon| {
+        src_slice = raw[0..colon];
+        dst_slice = raw[colon + 1..mem::len(raw)];
+    }
+    if !bytes::is_safe_rel_path(src_slice) {
+        set_diag(allocator, diag, line, "bin source path must be a safe relative path");
+        return Error::Validation;
+    }
+    if !bytes::is_safe_name(dst_slice) {
+        set_diag(allocator, diag, line, "bin destination name must be a safe filename");
+        return Error::Validation;
+    }
+    var src = string::from_bytes(allocator, src_slice) catch return Error::OutOfMemory;
+    errdefer src.deinit(allocator);
+    var dst = string::from_bytes(allocator, dst_slice) catch return Error::OutOfMemory;
+    errdefer dst.deinit(allocator);
+    return BinSpec { source: move src, dest: move dst };
+}
+
+fn valid_tool_name(name: []u8) -> bool {
+    let length = mem::len(name);
+    if length == 0 {
+        return false;
+    }
+    if mem::equal_bytes(name, ".") or mem::equal_bytes(name, "..") {
+        return false;
+    }
+    var i = 0;
+    while i < length {
+        if !is_tool_name_byte(name[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn valid_github_repo(repo: []u8) -> bool {
+    let slash = bytes::index_of_byte(repo, cast<u8>(47), 0) orelse return false;
+    if slash == 0 or slash + 1 >= mem::len(repo) {
+        return false;
+    }
+    if bytes::index_of_byte(repo, cast<u8>(47), slash + 1) |_| {
+        return false;
+    }
+    let owner = repo[0..slash];
+    let name = repo[slash + 1..mem::len(repo)];
+    return bytes::is_safe_name(owner) and bytes::is_safe_name(name);
+}
+
+fn has_tool_named(tools: &array::Array<ToolSpec>, name: []u8) -> bool {
+    var i = 0;
+    while tools.at(i) |tool| {
+        let tname = tool.name.as_bytes();
+        if mem::equal_bytes(tname, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn has_asset_named(assets: &array::Array<AssetSpec>, name: []u8) -> bool {
+    var i = 0;
+    while assets.at(i) |asset| {
+        let aname = asset.name.as_bytes();
+        if mem::equal_bytes(aname, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn parse_bool(
+    allocator: Allocator,
+    cur: &var Cursor,
+    diag: &var string::String,
+) -> Error!bool {
+    let start = cur.pos;
+    while peek(cur) |ch| {
+        if is_bare_key_byte(ch) {
+            let _ = advance(cur);
+        } else {
+            break;
+        }
+    }
+    let token = cur.input[start..cur.pos];
+    if mem::equal_bytes(token, "true") {
+        return true;
+    }
+    if mem::equal_bytes(token, "false") {
+        return false;
+    }
+    set_diag(allocator, diag, cur.line, "expected boolean 'true' or 'false'");
+    return Error::Syntax;
+}
+
+fn validate_asset(
+    allocator: Allocator,
+    asset: &AssetSpec,
+    diag: &var string::String,
+) -> Error!void {
+    let ver = asset.version.as_bytes();
+    if mem::len(ver) == 0 {
+        set_diag(allocator, diag, 0, "asset is missing required field 'version'");
+        return Error::Validation;
+    }
+    if mem::equal_bytes(ver, "latest") {
+        set_diag(allocator, diag, 0, "asset version must be pinned ('latest' is not allowed)");
+        return Error::Validation;
+    }
+    if asset.has_url and asset.has_github {
+        set_diag(allocator, diag, 0, "asset must specify either 'url' or 'github', not both");
+        return Error::Validation;
+    }
+    if !asset.has_url and !asset.has_github {
+        set_diag(allocator, diag, 0, "asset must specify 'url' or 'github' + 'asset'");
+        return Error::Validation;
+    }
+    if asset.has_github {
+        let gh = asset.github.as_bytes();
+        if !valid_github_repo(gh) {
+            set_diag(allocator, diag, 0, "asset 'github' must be in '<owner>/<repo>' format");
+            return Error::Validation;
+        }
+        if !asset.has_asset or asset.asset.len() == 0 {
+            set_diag(allocator, diag, 0, "asset with 'github' requires non-empty 'asset'");
+            return Error::Validation;
+        }
+    } else {
+        if asset.url.len() == 0 {
+            set_diag(allocator, diag, 0, "asset 'url' must not be empty");
+            return Error::Validation;
+        }
+        if asset.has_asset or asset.has_tag {
+            set_diag(allocator, diag, 0, "'asset' and 'tag' are only valid with 'github'");
+            return Error::Validation;
+        }
+    }
+    if asset.has_sha256 {
+        let h = asset.sha256.as_bytes();
+        if !bytes::is_valid_sha256_hex(h) {
+            set_diag(allocator, diag, 0, "asset 'sha256' must be 64 lowercase hex characters");
+            return Error::Validation;
+        }
+    }
+    return;
+}
+
+fn validate_tool(
+    allocator: Allocator,
+    tool: &ToolSpec,
+    diag: &var string::String,
+) -> Error!void {
+    let ver = tool.version.as_bytes();
+    if mem::len(ver) == 0 {
+        set_diag(allocator, diag, 0, "tool is missing required field 'version'");
+        return Error::Validation;
+    }
+    if mem::equal_bytes(ver, "latest") {
+        set_diag(allocator, diag, 0, "tool version must be pinned ('latest' is not allowed)");
+        return Error::Validation;
+    }
+    if tool.has_url and tool.has_github {
+        set_diag(allocator, diag, 0, "tool must specify either 'url' or 'github', not both");
+        return Error::Validation;
+    }
+    if !tool.has_url and !tool.has_github {
+        set_diag(allocator, diag, 0, "tool must specify 'url' or 'github' + 'asset'");
+        return Error::Validation;
+    }
+    if tool.has_github {
+        let gh = tool.github.as_bytes();
+        if !valid_github_repo(gh) {
+            set_diag(allocator, diag, 0, "tool 'github' must be in '<owner>/<repo>' format");
+            return Error::Validation;
+        }
+        if !tool.has_asset or tool.asset.len() == 0 {
+            set_diag(allocator, diag, 0, "tool with 'github' requires non-empty 'asset'");
+            return Error::Validation;
+        }
+    } else {
+        if tool.url.len() == 0 {
+            set_diag(allocator, diag, 0, "tool 'url' must not be empty");
+            return Error::Validation;
+        }
+        if tool.has_asset or tool.has_tag {
+            set_diag(allocator, diag, 0, "'asset' and 'tag' are only valid with 'github'");
+            return Error::Validation;
+        }
+    }
+    if tool.bins.len() == 0 {
+        set_diag(allocator, diag, 0, "tool requires non-empty 'bin' array");
+        return Error::Validation;
+    }
+    if tool.mode == InstallMode::Bootstrap {
+        if !tool.has_install_dir or tool.install_dir.len() == 0 {
+            set_diag(allocator, diag, 0, "tool with mode = 'bootstrap' requires 'install_dir'");
+            return Error::Validation;
+        }
+    }
+    if tool.has_sha256 {
+        let h = tool.sha256.as_bytes();
+        if !bytes::is_valid_sha256_hex(h) {
+            set_diag(allocator, diag, 0, "tool 'sha256' must be 64 lowercase hex characters");
+            return Error::Validation;
+        }
+    }
+    return;
+}
+
+fn parse_section_header(
+    allocator: Allocator,
+    cur: &var Cursor,
+    manifest: &var Manifest,
+    section: &var SectionKind,
+    current_tool: &var i64,
+    current_asset: &var i64,
+    seen_store: &var bool,
+    seen_env: &var bool,
+    seen_links: &var bool,
+    diag: &var string::String,
+) -> Error!void {
+    let _ = advance(cur);
+    skip_hspace(cur);
+    var head = string::new(allocator);
+    defer head.deinit(allocator);
+    try parse_key(allocator, cur, &var head, diag);
+    skip_hspace(cur);
+    let head_bytes = head.as_bytes();
+    if mem::equal_bytes(head_bytes, "store") {
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after [store");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after [store");
+            return Error::Syntax;
+        }
+        if seen_store.* {
+            set_diag(allocator, diag, cur.line, "duplicate [store] section");
+            return Error::Validation;
+        }
+        seen_store.* = true;
+        section.* = SectionKind::Store;
+        current_tool.* = -1;
+        current_asset.* = -1;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "env") {
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after [env");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after [env");
+            return Error::Syntax;
+        }
+        if seen_env.* {
+            set_diag(allocator, diag, cur.line, "duplicate [env] section");
+            return Error::Validation;
+        }
+        seen_env.* = true;
+        section.* = SectionKind::Env;
+        current_tool.* = -1;
+        current_asset.* = -1;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "links") {
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after [links");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after [links");
+            return Error::Syntax;
+        }
+        if seen_links.* {
+            set_diag(allocator, diag, cur.line, "duplicate [links] section");
+            return Error::Validation;
+        }
+        seen_links.* = true;
+        section.* = SectionKind::Links;
+        current_tool.* = -1;
+        current_asset.* = -1;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "tools") {
+        if advance(cur) |dot| {
+            if dot != cast<u8>(46) {
+                set_diag(allocator, diag, cur.line, "expected '.' in [tools.<name>]");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected '.' in [tools.<name>]");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        var tname = string::new(allocator);
+        defer tname.deinit(allocator);
+        if peek(cur) |b| {
+            if b == cast<u8>(34) {
+                try parse_quoted_string(allocator, cur, &var tname, diag);
+            } else {
+                let start = cur.pos;
+                while peek(cur) |ch| {
+                    if is_tool_name_byte(ch) {
+                        let _ = advance(cur);
+                    } else {
+                        break;
+                    }
+                }
+                if cur.pos == start {
+                    set_diag(allocator, diag, cur.line, "expected tool name after [tools.");
+                    return Error::Syntax;
+                }
+                tname.append_bytes(allocator, cur.input[start..cur.pos]) catch return Error::OutOfMemory;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected tool name after [tools.");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after tool name");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after tool name");
+            return Error::Syntax;
+        }
+        let name_bytes = tname.as_bytes();
+        if !valid_tool_name(name_bytes) {
+            set_diag(allocator, diag, cur.line, "invalid tool name");
+            return Error::Validation;
+        }
+        if has_tool_named(&manifest.tools, name_bytes) {
+            set_diag(allocator, diag, cur.line, "duplicate tool section");
+            return Error::Validation;
+        }
+        let spec = try new_tool_spec(allocator, name_bytes);
+        manifest.tools.append(allocator, move spec) catch return Error::OutOfMemory;
+        current_tool.* = manifest.tools.len() - 1;
+        current_asset.* = -1;
+        section.* = SectionKind::Tool;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "assets") {
+        if advance(cur) |dot| {
+            if dot != cast<u8>(46) {
+                set_diag(allocator, diag, cur.line, "expected '.' in [assets.<name>]");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected '.' in [assets.<name>]");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        var aname = string::new(allocator);
+        defer aname.deinit(allocator);
+        if peek(cur) |b| {
+            if b == cast<u8>(34) {
+                try parse_quoted_string(allocator, cur, &var aname, diag);
+            } else {
+                let start = cur.pos;
+                while peek(cur) |ch| {
+                    if is_tool_name_byte(ch) {
+                        let _ = advance(cur);
+                    } else {
+                        break;
+                    }
+                }
+                if cur.pos == start {
+                    set_diag(allocator, diag, cur.line, "expected asset name after [assets.");
+                    return Error::Syntax;
+                }
+                aname.append_bytes(allocator, cur.input[start..cur.pos]) catch return Error::OutOfMemory;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected asset name after [assets.");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after asset name");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after asset name");
+            return Error::Syntax;
+        }
+        let name_bytes = aname.as_bytes();
+        if !valid_tool_name(name_bytes) {
+            set_diag(allocator, diag, cur.line, "invalid asset name");
+            return Error::Validation;
+        }
+        if has_asset_named(&manifest.assets, name_bytes) {
+            set_diag(allocator, diag, cur.line, "duplicate asset section");
+            return Error::Validation;
+        }
+        let spec = try new_asset_spec(allocator, name_bytes);
+        manifest.assets.append(allocator, move spec) catch return Error::OutOfMemory;
+        current_asset.* = manifest.assets.len() - 1;
+        current_tool.* = -1;
+        section.* = SectionKind::Asset;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    set_diag(allocator, diag, cur.line, "unknown section header");
+    return Error::Validation;
+}
+
+fn parse_tool_field(
+    allocator: Allocator,
+    cur: &var Cursor,
+    key_str: &string::String,
+    tool: &var ToolSpec,
+    diag: &var string::String,
+) -> Error!void {
+    let key = key_str.as_bytes();
+    let field_line = cur.line;
+    if mem::equal_bytes(key, "version") {
+        if tool.version.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'version' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.version, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "url") {
+        if tool.has_url {
+            set_diag(allocator, diag, field_line, "duplicate 'url' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.url, diag);
+        tool.has_url = true;
+        return;
+    }
+    if mem::equal_bytes(key, "github") {
+        if tool.has_github {
+            set_diag(allocator, diag, field_line, "duplicate 'github' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.github, diag);
+        tool.has_github = true;
+        return;
+    }
+    if mem::equal_bytes(key, "asset") {
+        if tool.has_asset {
+            set_diag(allocator, diag, field_line, "duplicate 'asset' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.asset, diag);
+        tool.has_asset = true;
+        return;
+    }
+    if mem::equal_bytes(key, "tag") {
+        if tool.has_tag {
+            set_diag(allocator, diag, field_line, "duplicate 'tag' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.tag, diag);
+        tool.has_tag = true;
+        return;
+    }
+    if mem::equal_bytes(key, "bin") {
+        if tool.bins.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'bin' field");
+            return Error::Validation;
+        }
+        var raw_bins = array::new<string::String>(allocator);
+        defer raw_bins.deinit(allocator);
+        try parse_string_array(allocator, cur, &var raw_bins, diag);
+        var i = 0;
+        while raw_bins.at(i) |item| {
+            let raw = item.as_bytes();
+            let spec = try parse_bin_spec(allocator, raw, field_line, diag);
+            tool.bins.append(allocator, move spec) catch return Error::OutOfMemory;
+            i = i + 1;
+        }
+        return;
+    }
+    if mem::equal_bytes(key, "os_map") {
+        if tool.os_map.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'os_map' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var tool.os_map, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "arch_map") {
+        if tool.arch_map.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'arch_map' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var tool.arch_map, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "extract") {
+        var val = string::new(allocator);
+        defer val.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var val, diag);
+        let vb = val.as_bytes();
+        if mem::equal_bytes(vb, "bin") {
+            tool.extract = ExtractMode::Bin;
+        } else if mem::equal_bytes(vb, "all") {
+            tool.extract = ExtractMode::All;
+        } else {
+            set_diag(allocator, diag, field_line, "extract must be 'bin' or 'all'");
+            return Error::Validation;
+        }
+        return;
+    }
+    if mem::equal_bytes(key, "mode") {
+        var val = string::new(allocator);
+        defer val.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var val, diag);
+        let vb = val.as_bytes();
+        if mem::equal_bytes(vb, "store") {
+            tool.mode = InstallMode::Store;
+        } else if mem::equal_bytes(vb, "bootstrap") {
+            tool.mode = InstallMode::Bootstrap;
+        } else {
+            set_diag(allocator, diag, field_line, "mode must be 'store' or 'bootstrap'");
+            return Error::Validation;
+        }
+        return;
+    }
+    if mem::equal_bytes(key, "archive") {
+        var val = string::new(allocator);
+        defer val.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var val, diag);
+        let vb = val.as_bytes();
+        if mem::equal_bytes(vb, "auto") {
+            tool.archive = ArchiveMode::Auto;
+        } else if mem::equal_bytes(vb, "none") {
+            tool.archive = ArchiveMode::None;
+        } else {
+            set_diag(allocator, diag, field_line, "archive must be 'auto' or 'none'");
+            return Error::Validation;
+        }
+        return;
+    }
+    if mem::equal_bytes(key, "install_dir") {
+        if tool.has_install_dir {
+            set_diag(allocator, diag, field_line, "duplicate 'install_dir' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.install_dir, diag);
+        tool.has_install_dir = true;
+        return;
+    }
+    if mem::equal_bytes(key, "sha256") {
+        if tool.has_sha256 {
+            set_diag(allocator, diag, field_line, "duplicate 'sha256' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var tool.sha256, diag);
+        tool.has_sha256 = true;
+        return;
+    }
+    set_diag(allocator, diag, field_line, "unknown field in [tools.<name>]");
+    return Error::Validation;
+}
+
+fn parse_asset_field(
+    allocator: Allocator,
+    cur: &var Cursor,
+    key_str: &string::String,
+    asset: &var AssetSpec,
+    diag: &var string::String,
+) -> Error!void {
+    let key = key_str.as_bytes();
+    let field_line = cur.line;
+    if mem::equal_bytes(key, "version") {
+        if asset.version.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'version' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.version, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "url") {
+        if asset.has_url {
+            set_diag(allocator, diag, field_line, "duplicate 'url' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.url, diag);
+        asset.has_url = true;
+        return;
+    }
+    if mem::equal_bytes(key, "github") {
+        if asset.has_github {
+            set_diag(allocator, diag, field_line, "duplicate 'github' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.github, diag);
+        asset.has_github = true;
+        return;
+    }
+    if mem::equal_bytes(key, "asset") {
+        if asset.has_asset {
+            set_diag(allocator, diag, field_line, "duplicate 'asset' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.asset, diag);
+        asset.has_asset = true;
+        return;
+    }
+    if mem::equal_bytes(key, "tag") {
+        if asset.has_tag {
+            set_diag(allocator, diag, field_line, "duplicate 'tag' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.tag, diag);
+        asset.has_tag = true;
+        return;
+    }
+    if mem::equal_bytes(key, "os_map") {
+        if asset.os_map.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'os_map' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var asset.os_map, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "arch_map") {
+        if asset.arch_map.len() > 0 {
+            set_diag(allocator, diag, field_line, "duplicate 'arch_map' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var asset.arch_map, diag);
+        return;
+    }
+    if mem::equal_bytes(key, "archive") {
+        if asset.has_archive {
+            set_diag(allocator, diag, field_line, "duplicate 'archive' field");
+            return Error::Validation;
+        }
+        var val = string::new(allocator);
+        defer val.deinit(allocator);
+        try parse_quoted_string(allocator, cur, &var val, diag);
+        let vb = val.as_bytes();
+        if mem::equal_bytes(vb, "auto") {
+            asset.archive = ArchiveMode::Auto;
+        } else if mem::equal_bytes(vb, "none") {
+            asset.archive = ArchiveMode::None;
+        } else {
+            set_diag(allocator, diag, field_line, "archive must be 'auto' or 'none'");
+            return Error::Validation;
+        }
+        asset.has_archive = true;
+        return;
+    }
+    if mem::equal_bytes(key, "unwrap") {
+        if asset.has_unwrap {
+            set_diag(allocator, diag, field_line, "duplicate 'unwrap' field");
+            return Error::Validation;
+        }
+        asset.unwrap = try parse_bool(allocator, cur, diag);
+        asset.has_unwrap = true;
+        return;
+    }
+    if mem::equal_bytes(key, "sha256") {
+        if asset.has_sha256 {
+            set_diag(allocator, diag, field_line, "duplicate 'sha256' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var asset.sha256, diag);
+        asset.has_sha256 = true;
+        return;
+    }
+    set_diag(allocator, diag, field_line, "unknown field in [assets.<name>]");
+    return Error::Validation;
+}
+
+pub fn parse(
+    allocator: Allocator,
+    input: []u8,
+    diag: &var string::String,
+) -> Error!Manifest {
+    var manifest = Manifest {
+        store: StoreConfig {
+            has_max_size: false,
+            max_size_bytes: 0,
+        },
+        tools: array::new<ToolSpec>(allocator),
+        assets: array::new<AssetSpec>(allocator),
+        env: map::new<[]u8, string::String>(allocator),
+        links: map::new<[]u8, string::String>(allocator),
+    };
+    errdefer manifest.deinit(allocator);
+
+    var cur = Cursor { input: input, pos: 0, line: 1 };
+    var section = SectionKind::None;
+    var current_tool: i64 = -1;
+    var current_asset: i64 = -1;
+    var seen_store = false;
+    var seen_env = false;
+    var seen_links = false;
+
+    while true {
+        skip_ws_and_comments(&var cur);
+        let b = peek(&cur) orelse break;
+        if b == cast<u8>(91) {
+            try parse_section_header(
+                allocator,
+                &var cur,
+                &var manifest,
+                &var section,
+                &var current_tool,
+                &var current_asset,
+                &var seen_store,
+                &var seen_env,
+                &var seen_links,
+                diag,
+            );
+            continue;
+        }
+        if section == SectionKind::None {
+            set_diag(allocator, diag, cur.line, "key-value pair outside any section");
+            return Error::Syntax;
+        }
+        var key = string::new(allocator);
+        defer key.deinit(allocator);
+        try parse_key(allocator, &var cur, &var key, diag);
+        skip_hspace(&var cur);
+        if advance(&var cur) |eq| {
+            if eq != cast<u8>(61) {
+                set_diag(allocator, diag, cur.line, "expected '=' after key");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected '=' after key");
+            return Error::Syntax;
+        }
+        skip_hspace(&var cur);
+        let key_bytes = key.as_bytes();
+        if section == SectionKind::Store {
+            if !mem::equal_bytes(key_bytes, "max_size") {
+                set_diag(allocator, diag, cur.line, "unknown field in [store]");
+                return Error::Validation;
+            }
+            if manifest.store.has_max_size {
+                set_diag(allocator, diag, cur.line, "duplicate 'max_size' in [store]");
+                return Error::Validation;
+            }
+            if peek(&cur) |vb| {
+                if vb == cast<u8>(34) {
+                    var raw_size = string::new(allocator);
+                    defer raw_size.deinit(allocator);
+                    try parse_quoted_string(allocator, &var cur, &var raw_size, diag);
+                    let raw_bytes = raw_size.as_bytes();
+                    if bytes::parse_byte_size(raw_bytes) |parsed_size| {
+                        manifest.store.has_max_size = true;
+                        manifest.store.max_size_bytes = parsed_size;
+                    } else {
+                        set_diag(allocator, diag, cur.line, "invalid max_size byte budget");
+                        return Error::Validation;
+                    }
+                } else {
+                    let start = cur.pos;
+                    while peek(&cur) |d| {
+                        if d >= cast<u8>(48) and d <= cast<u8>(57) {
+                            let _ = advance(&var cur);
+                        } else {
+                            break;
+                        }
+                    }
+                    if cur.pos == start {
+                        set_diag(allocator, diag, cur.line, "max_size must be a byte-size string or positive integer");
+                        return Error::Syntax;
+                    }
+                    if bytes::parse_nonneg_i64(cur.input[start..cur.pos]) |parsed_size| {
+                        if parsed_size <= 0 {
+                            set_diag(allocator, diag, cur.line, "max_size must be positive");
+                            return Error::Validation;
+                        }
+                        manifest.store.has_max_size = true;
+                        manifest.store.max_size_bytes = parsed_size;
+                    } else {
+                        set_diag(allocator, diag, cur.line, "invalid max_size integer");
+                        return Error::Validation;
+                    }
+                }
+            } else {
+                set_diag(allocator, diag, cur.line, "expected max_size value");
+                return Error::Syntax;
+            }
+            try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::Env {
+            if manifest.env.contains(key_bytes) {
+                set_diag(allocator, diag, cur.line, "duplicate key in [env]");
+                return Error::Validation;
+            }
+            var val = string::new(allocator);
+            errdefer val.deinit(allocator);
+            try parse_quoted_string(allocator, &var cur, &var val, diag);
+            manifest.env.insert(allocator, key_bytes, move val) catch return Error::OutOfMemory;
+            try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::Links {
+            if mem::len(key_bytes) == 0 {
+                set_diag(allocator, diag, cur.line, "link destination must not be empty");
+                return Error::Validation;
+            }
+            if manifest.links.contains(key_bytes) {
+                set_diag(allocator, diag, cur.line, "duplicate destination in [links]");
+                return Error::Validation;
+            }
+            var val = string::new(allocator);
+            errdefer val.deinit(allocator);
+            try parse_quoted_string(allocator, &var cur, &var val, diag);
+            if val.len() == 0 {
+                set_diag(allocator, diag, cur.line, "link source must not be empty");
+                return Error::Validation;
+            }
+            manifest.links.insert(allocator, key_bytes, move val) catch return Error::OutOfMemory;
+            try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::Tool {
+            if manifest.tools.at_mut(current_tool) |tool| {
+                try parse_tool_field(allocator, &var cur, &key, tool, diag);
+            } else {
+                set_diag(allocator, diag, cur.line, "internal tool section error");
+                return Error::Syntax;
+            }
+            try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::Asset {
+            if manifest.assets.at_mut(current_asset) |asset| {
+                try parse_asset_field(allocator, &var cur, &key, asset, diag);
+            } else {
+                set_diag(allocator, diag, cur.line, "internal asset section error");
+                return Error::Syntax;
+            }
+            try skip_line_tail(allocator, &var cur, diag);
+        }
+    }
+
+    var idx = 0;
+    while manifest.tools.at(idx) |tool| {
+        try validate_tool(allocator, tool, diag);
+        idx = idx + 1;
+    }
+
+    var aidx = 0;
+    while manifest.assets.at(aidx) |asset| {
+        try validate_asset(allocator, asset, diag);
+        aidx = aidx + 1;
+    }
+
+    return move manifest;
+}
+
+pub fn expand_template(
+    allocator: Allocator,
+    template: []u8,
+    version: []u8,
+    os: []u8,
+    arch: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    let length = mem::len(template);
+    var i = 0;
+    while i < length {
+        if i + 9 <= length and mem::equal_bytes(template[i..i + 9], "{version}") {
+            try out.append_bytes(allocator, version);
+            i = i + 9;
+        } else if i + 4 <= length and mem::equal_bytes(template[i..i + 4], "{os}") {
+            try out.append_bytes(allocator, os);
+            i = i + 4;
+        } else if i + 6 <= length and mem::equal_bytes(template[i..i + 6], "{arch}") {
+            try out.append_bytes(allocator, arch);
+            i = i + 6;
+        } else {
+            try out.append_byte(allocator, template[i]);
+            i = i + 1;
+        }
+    }
+    return;
+}
+
+fn resolve_source_url(
+    allocator: Allocator,
+    version: []u8,
+    has_url: bool,
+    url: []u8,
+    github: []u8,
+    asset: []u8,
+    has_tag: bool,
+    tag: []u8,
+    os_map: &map::Map<[]u8, string::String>,
+    arch_map: &map::Map<[]u8, string::String>,
+    os: []u8,
+    arch: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    var mapped_os = string::new(allocator);
+    defer mapped_os.deinit(allocator);
+    if os_map.at(os) |found| {
+        let fb = found.as_bytes();
+        try mapped_os.append_bytes(allocator, fb);
+    } else {
+        try mapped_os.append_bytes(allocator, os);
+    }
+
+    var mapped_arch = string::new(allocator);
+    defer mapped_arch.deinit(allocator);
+    if arch_map.at(arch) |found| {
+        let fb = found.as_bytes();
+        try mapped_arch.append_bytes(allocator, fb);
+    } else {
+        try mapped_arch.append_bytes(allocator, arch);
+    }
+
+    let mos = mapped_os.as_bytes();
+    let march = mapped_arch.as_bytes();
+
+    if has_url {
+        try expand_template(allocator, url, version, mos, march, out);
+        return;
+    }
+
+    var expanded_tag = string::new(allocator);
+    defer expanded_tag.deinit(allocator);
+    if has_tag {
+        try expand_template(allocator, tag, version, mos, march, &var expanded_tag);
+    } else {
+        try expand_template(allocator, "v{version}", version, mos, march, &var expanded_tag);
+    }
+
+    var expanded_asset = string::new(allocator);
+    defer expanded_asset.deinit(allocator);
+    try expand_template(allocator, asset, version, mos, march, &var expanded_asset);
+
+    let tb = expanded_tag.as_bytes();
+    let ab = expanded_asset.as_bytes();
+    try out.append_bytes(allocator, "https://github.com/");
+    try out.append_bytes(allocator, github);
+    try out.append_bytes(allocator, "/releases/download/");
+    try out.append_bytes(allocator, tb);
+    try out.append_bytes(allocator, "/");
+    try out.append_bytes(allocator, ab);
+    return;
+}
+
+pub fn resolve_tool_url(
+    allocator: Allocator,
+    tool: &ToolSpec,
+    os: []u8,
+    arch: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    let ver = tool.version.as_bytes();
+    let url = tool.url.as_bytes();
+    let gh = tool.github.as_bytes();
+    let ast = tool.asset.as_bytes();
+    let tag = tool.tag.as_bytes();
+    return resolve_source_url(
+        allocator,
+        ver,
+        tool.has_url,
+        url,
+        gh,
+        ast,
+        tool.has_tag,
+        tag,
+        &tool.os_map,
+        &tool.arch_map,
+        os,
+        arch,
+        out,
+    );
+}
+
+pub fn resolve_asset_url(
+    allocator: Allocator,
+    asset: &AssetSpec,
+    os: []u8,
+    arch: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    let ver = asset.version.as_bytes();
+    let url = asset.url.as_bytes();
+    let gh = asset.github.as_bytes();
+    let ast = asset.asset.as_bytes();
+    let tag = asset.tag.as_bytes();
+    return resolve_source_url(
+        allocator,
+        ver,
+        asset.has_url,
+        url,
+        gh,
+        ast,
+        asset.has_tag,
+        tag,
+        &asset.os_map,
+        &asset.arch_map,
+        os,
+        arch,
+        out,
+    );
+}
+
+pub fn find_tool_index(manifest: &Manifest, name: []u8) -> ?i64 {
+    var i = 0;
+    while manifest.tools.at(i) |tool| {
+        let tn = tool.name.as_bytes();
+        if mem::equal_bytes(tn, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+pub fn find_asset_index(manifest: &Manifest, name: []u8) -> ?i64 {
+    var i = 0;
+    while manifest.assets.at(i) |asset| {
+        let an = asset.name.as_bytes();
+        if mem::equal_bytes(an, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+test "parse full manifest and expand templates" {
+    let allocator = mem::page_allocator();
+    let doc =
+        \\# Example manifest
+        \\[store]
+        \\max_size = "4GB"
+        \\
+        \\[tools.ripgrep]
+        \\github = "BurntSushi/ripgrep"
+        \\version = "14.1.1"
+        \\tag = "{version}"
+        \\asset = "ripgrep-{version}-{arch}-{os}.tar.gz"
+        \\os_map = { darwin = "apple-darwin", linux = "unknown-linux-musl" }
+        \\bin = ["rg"]
+        \\
+        \\[tools.zig]
+        \\version = "0.16.0"
+        \\url = "https://ziglang.org/download/{version}/zig-{arch}-{os}-{version}.tar.xz"
+        \\os_map = { darwin = "macos" }
+        \\extract = "all"
+        \\bin = ["zig"]
+        \\
+        \\[tools.agent]
+        \\version = "2.3.2"
+        \\url = "https://example.com/agent-{version}-{os}-{arch}"
+        \\archive = "none"
+        \\mode = "bootstrap"
+        \\install_dir = "~/.agent/bin"
+        \\bin = ["agent-raw:agent"]
+        \\sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\
+        \\[env]
+        \\EDITOR = "nvim"
+        \\TOOL_HOME = "~/tools"
+        \\
+        \\[links]
+        \\"~/.config/nvim" = "~/my-configs/nvim"
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+
+        testing::expect(m.store.has_max_size);
+        testing::expect_equal<i64>(4 * 1024 * 1024 * 1024, m.store.max_size_bytes);
+        testing::expect_equal<i64>(3, m.tools.len());
+
+        if m.tools.at(0) |rg| {
+            var resolved = string::new(allocator);
+            defer resolved.deinit(allocator);
+            if resolve_tool_url(allocator, rg, "darwin", "aarch64", &var resolved) {
+                let url_bytes = resolved.as_bytes();
+                testing::expect_equal<[]u8>(
+                    "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-aarch64-apple-darwin.tar.gz",
+                    url_bytes,
+                );
+            } else |_| {
+                testing::fail("resolve rg failed");
+            }
+        } else {
+            testing::fail("missing rg");
+        }
+
+        if m.tools.at(1) |zig| {
+            testing::expect(zig.extract == ExtractMode::All);
+            var resolved = string::new(allocator);
+            defer resolved.deinit(allocator);
+            if resolve_tool_url(allocator, zig, "darwin", "aarch64", &var resolved) {
+                let url_bytes = resolved.as_bytes();
+                testing::expect_equal<[]u8>(
+                    "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+                    url_bytes,
+                );
+            } else |_| {
+                testing::fail("resolve zig failed");
+            }
+        } else {
+            testing::fail("missing zig");
+        }
+
+        if m.tools.at(2) |agent| {
+            testing::expect(agent.mode == InstallMode::Bootstrap);
+            testing::expect(agent.archive == ArchiveMode::None);
+            testing::expect(agent.has_sha256);
+            if agent.bins.at(0) |bs| {
+                let src = bs.source.as_bytes();
+                let dst = bs.dest.as_bytes();
+                testing::expect_equal<[]u8>("agent-raw", src);
+                testing::expect_equal<[]u8>("agent", dst);
+            } else {
+                testing::fail("missing bin spec");
+            }
+        } else {
+            testing::fail("missing agent");
+        }
+
+        if m.env.at("EDITOR") |v| {
+            let vb = v.as_bytes();
+            testing::expect_equal<[]u8>("nvim", vb);
+        } else {
+            testing::fail("missing env EDITOR");
+        }
+
+        if m.links.at("~/.config/nvim") |v| {
+            let vb = v.as_bytes();
+            testing::expect_equal<[]u8>("~/my-configs/nvim", vb);
+        } else {
+            testing::fail("missing link");
+        }
+    } else |_| {
+        let msg = diag.as_bytes();
+        testing::fail(msg);
+    }
+}
+
+test "github default tag expansion" {
+    let allocator = mem::page_allocator();
+    let doc =
+        \\[tools.fd]
+        \\github = "sharkdp/fd"
+        \\version = "10.2.0"
+        \\asset = "fd-v{version}-{arch}-{os}.tar.gz"
+        \\arch_map = { aarch64 = "arm64", x86_64 = "amd64" }
+        \\bin = ["fd"]
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.tools.at(0) |fd| {
+            var resolved = string::new(allocator);
+            defer resolved.deinit(allocator);
+            if resolve_tool_url(allocator, fd, "linux", "x86_64", &var resolved) {
+                let url_bytes = resolved.as_bytes();
+                testing::expect_equal<[]u8>(
+                    "https://github.com/sharkdp/fd/releases/download/v10.2.0/fd-v10.2.0-amd64-linux.tar.gz",
+                    url_bytes,
+                );
+            } else |_| {
+                testing::fail("resolve failed");
+            }
+        } else {
+            testing::fail("missing fd");
+        }
+    } else |_| {
+        testing::fail("parse failed");
+    }
+}
+
+test "manifest validation rejections" {
+    let allocator = mem::page_allocator();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+
+    let latest_doc =
+        \\[tools.foo]
+        \\version = "latest"
+        \\url = "https://example.com/foo"
+        \\bin = ["foo"]
+    ;
+    if parse(allocator, latest_doc, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("latest version should be rejected");
+    } else |_| {}
+
+    let no_install_dir =
+        \\[tools.foo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/foo"
+        \\mode = "bootstrap"
+        \\bin = ["foo"]
+    ;
+    if parse(allocator, no_install_dir, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("bootstrap without install_dir should be rejected");
+    } else |_| {}
+
+    let bad_sha =
+        \\[tools.foo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/foo"
+        \\bin = ["foo"]
+        \\sha256 = "not-hex"
+    ;
+    if parse(allocator, bad_sha, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("invalid sha256 should be rejected");
+    } else |_| {}
+
+    let bad_bin_traversal =
+        \\[tools.foo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/foo"
+        \\bin = ["../escape"]
+    ;
+    if parse(allocator, bad_bin_traversal, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("bin path traversal should be rejected");
+    } else |_| {}
+
+    let both_sources =
+        \\[tools.foo]
+        \\version = "1.0.0"
+        \\url = "https://example.com/foo"
+        \\github = "org/repo"
+        \\asset = "foo.tar.gz"
+        \\bin = ["foo"]
+    ;
+    if parse(allocator, both_sources, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("url + github together should be rejected");
+    } else |_| {}
+
+    let unknown_section =
+        \\[unknown]
+        \\a = "b"
+    ;
+    if parse(allocator, unknown_section, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("unknown section should be rejected");
+    } else |_| {}
+
+    let multiline_bins =
+        \\[store]
+        \\max_size = 2048
+        \\
+        \\[tools.multi]
+        \\version = "1.2.3"
+        \\url = "https://example.com/multi.tar.gz"
+        \\bin = [
+        \\  # comment inside array
+        \\  "bin/a",
+        \\  "bin/b:c",
+        \\]
+    ;
+    if parse(allocator, multiline_bins, &var diag) |ok| {
+        defer ok.deinit(allocator);
+        testing::expect_equal<i64>(2048, ok.store.max_size_bytes);
+        if ok.tools.at(0) |t| {
+            testing::expect_equal<i64>(2, t.bins.len());
+        } else {
+            testing::fail("missing multi tool");
+        }
+    } else |_| {
+        testing::fail("multiline bins should parse");
+    }
+}
+
+test "parse assets sections and validate rejections" {
+    let allocator = mem::page_allocator();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+
+    let doc =
+        \\[assets.fonts]
+        \\github = "example-org/fonts"
+        \\version = "2.1.0"
+        \\tag = "fonts-{version}"
+        \\asset = "fonts-{version}-{os}-{arch}.tar.gz"
+        \\os_map = { darwin = "macos", linux = "linux" }
+        \\arch_map = { aarch64 = "arm64", x86_64 = "x64" }
+        \\
+        \\[assets.dict]
+        \\version = "1.0.0"
+        \\url = "https://example.com/packs/dict-{version}.dat"
+        \\archive = "none"
+        \\unwrap = false
+        \\sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ;
+    if parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+        testing::expect_equal<i64>(0, m.tools.len());
+        testing::expect_equal<i64>(2, m.assets.len());
+        if find_asset_index(&m, "fonts") |fi| {
+            testing::expect_equal<i64>(0, fi);
+        } else {
+            testing::fail("find_asset_index fonts failed");
+        }
+        if m.assets.at(0) |fonts| {
+            testing::expect(fonts.unwrap);
+            testing::expect(fonts.archive == ArchiveMode::Auto);
+            var resolved = string::new(allocator);
+            defer resolved.deinit(allocator);
+            if resolve_asset_url(allocator, fonts, "darwin", "aarch64", &var resolved) {
+                let ub = resolved.as_bytes();
+                testing::expect_equal<[]u8>(
+                    "https://github.com/example-org/fonts/releases/download/fonts-2.1.0/fonts-2.1.0-macos-arm64.tar.gz",
+                    ub,
+                );
+            } else |_| {
+                testing::fail("resolve_asset_url failed");
+            }
+        } else {
+            testing::fail("missing fonts asset");
+        }
+        if m.assets.at(1) |dict| {
+            testing::expect(!dict.unwrap);
+            testing::expect(dict.archive == ArchiveMode::None);
+            testing::expect(dict.has_sha256);
+        } else {
+            testing::fail("missing dict asset");
+        }
+    } else |_| {
+        let msg = diag.as_bytes();
+        testing::fail(msg);
+    }
+
+    let bin_in_asset =
+        \\[assets.bad]
+        \\version = "1.0.0"
+        \\url = "https://example.com/bad.tar.gz"
+        \\bin = ["bad"]
+    ;
+    if parse(allocator, bin_in_asset, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("bin field in [assets.<name>] must be rejected");
+    } else |_| {}
+
+    let bad_unwrap =
+        \\[assets.bad]
+        \\version = "1.0.0"
+        \\url = "https://example.com/bad.tar.gz"
+        \\unwrap = "yes"
+    ;
+    if parse(allocator, bad_unwrap, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("non-boolean unwrap must be rejected");
+    } else |_| {}
+
+    let latest_asset =
+        \\[assets.bad]
+        \\version = "latest"
+        \\url = "https://example.com/bad.tar.gz"
+    ;
+    if parse(allocator, latest_asset, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("latest version in asset must be rejected");
+    } else |_| {}
+}

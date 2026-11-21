@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check formatting hygiene and public-repo rules
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          errors = []
+          root = pathlib.Path(".")
+          abs_home_re = re.compile(r"(/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/|/Volumes/[A-Za-z0-9._-]+/)")
+          for p in sorted(root.rglob("*")):
+              if not p.is_file() or ".git" in p.parts:
+                  continue
+              raw = p.read_bytes()
+              if b"\x00" in raw:
+                  continue
+              text = raw.decode("utf-8")
+              if text and not text.endswith("\n"):
+                  errors.append(f"{p}: missing trailing newline")
+              for idx, line in enumerate(text.splitlines(), 1):
+                  if line.endswith((" ", "\t")):
+                      errors.append(f"{p}:{idx}: trailing whitespace")
+                  if p.as_posix() not in ("scripts/lint.sh", ".github/workflows/ci.yml") and abs_home_re.search(line):
+                      errors.append(f"{p}:{idx}: hardcoded local host path")
+          if errors:
+              for e in errors:
+                  print(f"error: {e}", file=sys.stderr)
+              sys.exit(1)
+          print("hygiene: ok")
+          PY
+
+  test:
+    needs: hygiene
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            kizu_target: linux-amd64
+            kizu_sha256: 6477bf6519c1a0d40151e0a19474e3b2b02db1f495da2eaab1b983f1bae9f8b4
+          - os: macos-15
+            kizu_target: darwin-arm64
+            kizu_sha256: e0e05678783fd25d3276611857b2e2eb346f3ce5715758447ca26cb33c7e9c74
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      KIZU_VERSION: v0.8.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Kizu ${{ env.KIZU_VERSION }}
+        env:
+          KIZU_TARGET: ${{ matrix.kizu_target }}
+          KIZU_SHA256: ${{ matrix.kizu_sha256 }}
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/kizu-${KIZU_VERSION}-${KIZU_TARGET}.tar.gz"
+          url="https://github.com/kizu-lang/kizu/releases/download/${KIZU_VERSION}/kizu-${KIZU_VERSION}-${KIZU_TARGET}.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" "$url"
+          python3 - "$archive" "$KIZU_SHA256" <<'PY'
+          import hashlib, pathlib, sys
+          path, expected = sys.argv[1], sys.argv[2]
+          actual = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          if actual != expected:
+              sys.exit(f"sha256 mismatch: expected {expected}, got {actual}")
+          PY
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          prefix="$RUNNER_TEMP/kizu-${KIZU_VERSION}-${KIZU_TARGET}"
+          echo "KIZU=$prefix/bin/kizu" >> "$GITHUB_ENV"
+          echo "KIZU_LIB_DIR=$prefix/lib/kizu" >> "$GITHUB_ENV"
+      - name: Lint, unit test, build, and run integration tests
+        run: |
+          sh scripts/lint.sh
+          sh scripts/build.sh
+          sh scripts/test-integration.sh

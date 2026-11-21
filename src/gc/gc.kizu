@@ -1,0 +1,686 @@
+import kugi::bytes;
+import kugi::lockfile;
+import kugi::manifest;
+import kugi::posix;
+import kugi::roots;
+import kugi::store;
+import std::array;
+import std::fmt;
+import std::fs;
+import std::io;
+import std::map;
+import std::mem;
+import std::path;
+import std::process;
+import std::string;
+import std::testing;
+
+pub error Error {
+    IoFailed,
+    OutOfMemory,
+}
+
+pub struct StoreUsage {
+    pub total_bytes: i64,
+    pub reclaimable_bytes: i64,
+    pub live_entries: i64,
+    pub dead_entries: i64,
+}
+
+pub struct GcReport {
+    pub deleted_roots: i64,
+    pub deleted_entries: i64,
+    pub deleted_tmp: i64,
+    pub freed_bytes: i64,
+    pub live_bytes: i64,
+    pub kept_entries: i64,
+}
+
+struct StoreEntryInfo {
+    name: string::String,
+    full_path: string::String,
+    mtime: i64,
+    size: i64,
+}
+
+fn (self: StoreEntryInfo) deinit(allocator: Allocator) -> void {
+    self.name.deinit(allocator);
+    self.full_path.deinit(allocator);
+    return;
+}
+
+fn mark_live(
+    allocator: Allocator,
+    live_keys: &var map::Map<[]u8, bool>,
+    key: []u8,
+) -> Error!void {
+    let bare = roots::bare_store_key(key);
+    if mem::len(bare) == 0 {
+        return;
+    }
+    if !live_keys.contains(bare) {
+        live_keys.insert(allocator, bare, true) catch return Error::OutOfMemory;
+    }
+    return;
+}
+
+fn collect_keys_from_live_manifest(
+    handle: Io,
+    allocator: Allocator,
+    manifest_path: []u8,
+    lock_path: []u8,
+    live_keys: &var map::Map<[]u8, bool>,
+) -> Error!bool {
+    var mraw = fs::read_file(handle, allocator, manifest_path, mem::Limit::Bytes(4194304)) catch return false;
+    defer mraw.deinit(allocator);
+    let mb = mraw.as_bytes();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    var m = manifest::parse(allocator, mb, &var diag) catch return false;
+    defer m.deinit(allocator);
+
+    var has_lock = false;
+    var lf = lockfile::new_lockfile(allocator);
+    defer lf.deinit(allocator);
+    let lkind = posix::inspect_path(handle, allocator, lock_path) catch posix::PathKind::Missing;
+    if lkind == posix::PathKind::File or lkind == posix::PathKind::Symlink {
+        if fs::read_file(handle, allocator, lock_path, mem::Limit::Bytes(16777216)) |lraw| {
+            defer lraw.deinit(allocator);
+            let lb = lraw.as_bytes();
+            if lockfile::decode(allocator, lb) |decoded| {
+                defer decoded.deinit(allocator);
+                has_lock = true;
+                var ti = 0;
+                while m.tools.at(ti) |tool| {
+                    if tool.mode == manifest::InstallMode::Store {
+                        let tname = tool.name.as_bytes();
+                        let tver = tool.version.as_bytes();
+                        if tool.has_sha256 {
+                            let sb = tool.sha256.as_bytes();
+                            var key = string::new(allocator);
+                            defer key.deinit(allocator);
+                            store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                            let kb = key.as_bytes();
+                            try mark_live(allocator, live_keys, kb);
+                        } else if decoded.tools.at(tname) |tlock| {
+                            let lver = tlock.version.as_bytes();
+                            if mem::equal_bytes(lver, tver) {
+                                var j = 0;
+                                while tlock.targets.key_at(j) |tk| {
+                                    if tlock.targets.at(tk) |entry| {
+                                        let sb = entry.sha256.as_bytes();
+                                        var key = string::new(allocator);
+                                        defer key.deinit(allocator);
+                                        store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                                        let kb = key.as_bytes();
+                                        try mark_live(allocator, live_keys, kb);
+                                    }
+                                    j = j + 1;
+                                }
+                            }
+                        }
+                    }
+                    ti = ti + 1;
+                }
+                var ai = 0;
+                while m.assets.at(ai) |asset| {
+                    let aname = asset.name.as_bytes();
+                    let aver = asset.version.as_bytes();
+                    if asset.has_sha256 {
+                        let sb = asset.sha256.as_bytes();
+                        var key = string::new(allocator);
+                        defer key.deinit(allocator);
+                        store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                        let kb = key.as_bytes();
+                        try mark_live(allocator, live_keys, kb);
+                    } else if decoded.assets.at(aname) |alock| {
+                        let lver = alock.version.as_bytes();
+                        if mem::equal_bytes(lver, aver) {
+                            var j = 0;
+                            while alock.targets.key_at(j) |tk| {
+                                if alock.targets.at(tk) |entry| {
+                                    let sb = entry.sha256.as_bytes();
+                                    var key = string::new(allocator);
+                                    defer key.deinit(allocator);
+                                    store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                                    let kb = key.as_bytes();
+                                    try mark_live(allocator, live_keys, kb);
+                                }
+                                j = j + 1;
+                            }
+                        }
+                    }
+                    ai = ai + 1;
+                }
+                return true;
+            } else |_| {
+                return false;
+            }
+        } else |_| {
+            return false;
+        }
+    }
+
+    if !has_lock {
+        var any_needs_lock = false;
+        var ti = 0;
+        while m.tools.at(ti) |tool| {
+            if tool.mode == manifest::InstallMode::Store {
+                if tool.has_sha256 {
+                    let tname = tool.name.as_bytes();
+                    let tver = tool.version.as_bytes();
+                    let sb = tool.sha256.as_bytes();
+                    var key = string::new(allocator);
+                    defer key.deinit(allocator);
+                    store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                    let kb = key.as_bytes();
+                    try mark_live(allocator, live_keys, kb);
+                } else {
+                    any_needs_lock = true;
+                }
+            }
+            ti = ti + 1;
+        }
+        var ai = 0;
+        while m.assets.at(ai) |asset| {
+            if asset.has_sha256 {
+                let aname = asset.name.as_bytes();
+                let aver = asset.version.as_bytes();
+                let sb = asset.sha256.as_bytes();
+                var key = string::new(allocator);
+                defer key.deinit(allocator);
+                store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                let kb = key.as_bytes();
+                try mark_live(allocator, live_keys, kb);
+            } else {
+                any_needs_lock = true;
+            }
+            ai = ai + 1;
+        }
+        return !any_needs_lock;
+    }
+    return true;
+}
+
+fn scan_roots(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    delete_dead_roots: bool,
+    live_keys: &var map::Map<[]u8, bool>,
+    out_deleted_roots: &var i64,
+) -> Error!void {
+    let rdir = paths.roots_dir.as_bytes();
+    let rkind = posix::inspect_path(handle, allocator, rdir) catch return Error::IoFailed;
+    if rkind != posix::PathKind::Dir {
+        return;
+    }
+    var entries = fs::read_dir(handle, allocator, rdir) catch return Error::IoFailed;
+    defer entries.deinit(allocator);
+    var i = 0;
+    while entries.at(i) |entry| {
+        let name = entry.name.as_bytes();
+        let full = entry.path.as_bytes();
+        if !bytes::ends_with(name, ".json") {
+            i = i + 1;
+            continue;
+        }
+        if fs::read_file(handle, allocator, full, mem::Limit::Bytes(1048576)) |raw| {
+            defer raw.deinit(allocator);
+            let rb = raw.as_bytes();
+            if roots::decode_root(allocator, rb) |rec| {
+                defer rec.deinit(allocator);
+                let mp = rec.manifest.as_bytes();
+                let lp = rec.lockfile.as_bytes();
+                let mkind = posix::inspect_path(handle, allocator, mp) catch posix::PathKind::Missing;
+                if mkind == posix::PathKind::Missing {
+                    out_deleted_roots.* = out_deleted_roots.* + 1;
+                    if delete_dead_roots {
+                        let _ = posix::unlink_if_exists(allocator, full);
+                    }
+                } else {
+                    let parsed_live = try collect_keys_from_live_manifest(handle, allocator, mp, lp, live_keys);
+                    if !parsed_live {
+                        var ki = 0;
+                        while rec.store_keys.at(ki) |sk| {
+                            let skb = sk.as_bytes();
+                            try mark_live(allocator, live_keys, skb);
+                            ki = ki + 1;
+                        }
+                    }
+                }
+            } else |_| {}
+        } else |_| {}
+        i = i + 1;
+    }
+    return;
+}
+
+fn entry_before(a: &StoreEntryInfo, b: &StoreEntryInfo) -> bool {
+    if a.mtime != b.mtime {
+        return a.mtime < b.mtime;
+    }
+    let an = a.name.as_bytes();
+    let bn = b.name.as_bytes();
+    return mem::compare(an, bn) < 0;
+}
+
+fn sort_entries_lru(entries: &var array::Array<StoreEntryInfo>) -> void {
+    let n = entries.len();
+    var i = 1;
+    while i < n {
+        var j = i;
+        while j > 0 {
+            var should_swap = false;
+            if entries.at(j) |cur| {
+                if entries.at(j - 1) |prev| {
+                    should_swap = entry_before(cur, prev);
+                }
+            }
+            if !should_swap {
+                break;
+            }
+            entries.swap(j, j - 1) catch break;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn collect_store_entries(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    live_keys: &map::Map<[]u8, bool>,
+    out_dead: &var array::Array<StoreEntryInfo>,
+    out_live_bytes: &var i64,
+    out_live_count: &var i64,
+) -> Error!void {
+    let sdir = paths.store_dir.as_bytes();
+    let skind = posix::inspect_path(handle, allocator, sdir) catch return Error::IoFailed;
+    if skind != posix::PathKind::Dir {
+        return;
+    }
+    var entries = fs::read_dir(handle, allocator, sdir) catch return Error::IoFailed;
+    defer entries.deinit(allocator);
+    var i = 0;
+    while entries.at(i) |entry| {
+        let name = entry.name.as_bytes();
+        let full = entry.path.as_bytes();
+        let size = posix::tree_size_bytes(handle, allocator, full) catch 0;
+        if live_keys.contains(name) {
+            out_live_bytes.* = out_live_bytes.* + size;
+            out_live_count.* = out_live_count.* + 1;
+        } else {
+            let mtime = posix::path_mtime_secs(allocator, full) catch 0;
+            var name_copy = string::from_bytes(allocator, name) catch return Error::OutOfMemory;
+            errdefer name_copy.deinit(allocator);
+            var path_copy = string::from_bytes(allocator, full) catch return Error::OutOfMemory;
+            errdefer path_copy.deinit(allocator);
+            let info = StoreEntryInfo {
+                name: move name_copy,
+                full_path: move path_copy,
+                mtime: mtime,
+                size: size,
+            };
+            out_dead.append(allocator, move info) catch return Error::OutOfMemory;
+        }
+        i = i + 1;
+    }
+    sort_entries_lru(out_dead);
+    return;
+}
+
+pub fn compute_store_usage(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+) -> Error!StoreUsage {
+    var live_keys = map::new<[]u8, bool>(allocator);
+    defer live_keys.deinit(allocator);
+    var dead_roots: i64 = 0;
+    try scan_roots(handle, allocator, paths, false, &var live_keys, &var dead_roots);
+
+    var dead_entries = array::new<StoreEntryInfo>(allocator);
+    defer dead_entries.deinit(allocator);
+    var live_bytes: i64 = 0;
+    var live_count: i64 = 0;
+    try collect_store_entries(handle, allocator, paths, &live_keys, &var dead_entries, &var live_bytes, &var live_count);
+
+    var dead_bytes: i64 = 0;
+    var i = 0;
+    while dead_entries.at(i) |item| {
+        dead_bytes = dead_bytes + item.size;
+        i = i + 1;
+    }
+    return StoreUsage {
+        total_bytes: live_bytes + dead_bytes,
+        reclaimable_bytes: dead_bytes,
+        live_entries: live_count,
+        dead_entries: dead_entries.len(),
+    };
+}
+
+fn clean_stale_tmp(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    dry_run: bool,
+    now_secs: i64,
+    out_deleted_tmp: &var i64,
+    out_freed_bytes: &var i64,
+) -> Error!void {
+    let tdir = paths.tmp_dir.as_bytes();
+    let tkind = posix::inspect_path(handle, allocator, tdir) catch return Error::IoFailed;
+    if tkind != posix::PathKind::Dir {
+        return;
+    }
+    var entries = fs::read_dir(handle, allocator, tdir) catch return Error::IoFailed;
+    defer entries.deinit(allocator);
+    var i = 0;
+    while entries.at(i) |entry| {
+        let full = entry.path.as_bytes();
+        let mtime = posix::path_mtime_secs(allocator, full) catch now_secs;
+        if now_secs - mtime > 3600 {
+            let sz = posix::tree_size_bytes(handle, allocator, full) catch 0;
+            out_deleted_tmp.* = out_deleted_tmp.* + 1;
+            out_freed_bytes.* = out_freed_bytes.* + sz;
+            if !dry_run {
+                let _ = posix::remove_tree(handle, allocator, full);
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+pub fn run_gc(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    dry_run: bool,
+) -> Error!GcReport {
+    var report = GcReport {
+        deleted_roots: 0,
+        deleted_entries: 0,
+        deleted_tmp: 0,
+        freed_bytes: 0,
+        live_bytes: 0,
+        kept_entries: 0,
+    };
+
+    let kh = paths.kugi_home.as_bytes();
+    let kh_kind = posix::inspect_path(handle, allocator, kh) catch return Error::IoFailed;
+    if kh_kind != posix::PathKind::Dir {
+        return report;
+    }
+
+    let ldir = paths.locks_dir.as_bytes();
+    posix::create_dir_all(handle, allocator, ldir) catch return Error::IoFailed;
+    var lock_file = path::join(allocator, ldir, "gc.lock") catch return Error::OutOfMemory;
+    defer lock_file.deinit(allocator);
+    let lfb = lock_file.as_bytes();
+
+    var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+    let res = run_gc_locked(handle, allocator, paths, dry_run, &var report);
+    posix::release_lock(&var guard);
+    if res {} else |err| {
+        return err;
+    }
+    return report;
+}
+
+fn run_gc_locked(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    dry_run: bool,
+    report: &var GcReport,
+) -> Error!void {
+    var live_keys = map::new<[]u8, bool>(allocator);
+    defer live_keys.deinit(allocator);
+    try scan_roots(handle, allocator, paths, !dry_run, &var live_keys, &var report.deleted_roots);
+
+    var dead_entries = array::new<StoreEntryInfo>(allocator);
+    defer dead_entries.deinit(allocator);
+    try collect_store_entries(
+        handle,
+        allocator,
+        paths,
+        &live_keys,
+        &var dead_entries,
+        &var report.live_bytes,
+        &var report.kept_entries,
+    );
+
+    var i = 0;
+    while dead_entries.at(i) |item| {
+        report.deleted_entries = report.deleted_entries + 1;
+        report.freed_bytes = report.freed_bytes + item.size;
+        if !dry_run {
+            let fp = item.full_path.as_bytes();
+            let _ = posix::remove_tree(handle, allocator, fp);
+        }
+        i = i + 1;
+    }
+
+    let now_secs = process::unix_millis() / 1000;
+    try clean_stale_tmp(handle, allocator, paths, dry_run, now_secs, &var report.deleted_tmp, &var report.freed_bytes);
+    return;
+}
+
+pub fn enforce_budget(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    max_size_bytes: i64,
+) -> Error!GcReport {
+    var report = GcReport {
+        deleted_roots: 0,
+        deleted_entries: 0,
+        deleted_tmp: 0,
+        freed_bytes: 0,
+        live_bytes: 0,
+        kept_entries: 0,
+    };
+    if max_size_bytes <= 0 {
+        return report;
+    }
+
+    let ldir = paths.locks_dir.as_bytes();
+    posix::create_dir_all(handle, allocator, ldir) catch return Error::IoFailed;
+    var lock_file = path::join(allocator, ldir, "gc.lock") catch return Error::OutOfMemory;
+    defer lock_file.deinit(allocator);
+    let lfb = lock_file.as_bytes();
+
+    var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+    let res = enforce_budget_locked(handle, allocator, paths, max_size_bytes, &var report);
+    posix::release_lock(&var guard);
+    if res {} else |err| {
+        return err;
+    }
+    return report;
+}
+
+fn enforce_budget_locked(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    max_size_bytes: i64,
+    report: &var GcReport,
+) -> Error!void {
+    var live_keys = map::new<[]u8, bool>(allocator);
+    defer live_keys.deinit(allocator);
+    try scan_roots(handle, allocator, paths, true, &var live_keys, &var report.deleted_roots);
+
+    var dead_entries = array::new<StoreEntryInfo>(allocator);
+    defer dead_entries.deinit(allocator);
+    try collect_store_entries(
+        handle,
+        allocator,
+        paths,
+        &live_keys,
+        &var dead_entries,
+        &var report.live_bytes,
+        &var report.kept_entries,
+    );
+
+    var total = report.live_bytes;
+    var k = 0;
+    while dead_entries.at(k) |item| {
+        total = total + item.size;
+        k = k + 1;
+    }
+
+    var i = 0;
+    while total > max_size_bytes and i < dead_entries.len() {
+        if dead_entries.at(i) |item| {
+            let fp = item.full_path.as_bytes();
+            let _ = posix::remove_tree(handle, allocator, fp);
+            total = total - item.size;
+            report.deleted_entries = report.deleted_entries + 1;
+            report.freed_bytes = report.freed_bytes + item.size;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+test "gc prunes dead worktree roots and enforces LRU budget" {
+    let handle = io::blocking();
+    let allocator = mem::page_allocator();
+    var base = string::new(allocator);
+    defer base.deinit(allocator);
+    let tmp_root = process::env("TMPDIR") orelse "/tmp";
+    base.append_bytes(allocator, tmp_root) catch return;
+    base.append_bytes(allocator, "/kugi-gc-test-") catch return;
+    fmt::append_i64(allocator, &var base, posix::pid()) catch return;
+    base.append_bytes(allocator, "-") catch return;
+    fmt::append_i64(allocator, &var base, process::unix_millis()) catch return;
+    let base_bytes = base.as_bytes();
+    let _ = posix::create_dir_all(handle, allocator, base_bytes);
+
+    var kh = path::join(allocator, base_bytes, "kugi_home") catch return;
+    defer kh.deinit(allocator);
+    let khb = kh.as_bytes();
+    var gm = path::join(allocator, base_bytes, "global.toml") catch return;
+    defer gm.deinit(allocator);
+    let gmb = gm.as_bytes();
+    var paths = store::paths_from_root(allocator, khb, base_bytes, gmb) catch return;
+    defer paths.deinit(allocator);
+    if store::ensure_layout(handle, allocator, &paths) {} else |_| {
+        testing::fail("ensure_layout failed");
+        return;
+    }
+
+    let sd = paths.store_dir.as_bytes();
+    var live_entry = path::join(allocator, sd, "live-1.0.0-111111111111/bin/live") catch return;
+    defer live_entry.deinit(allocator);
+    let leb = live_entry.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, leb, "1234567890", "1");
+
+    var live_asset = path::join(allocator, sd, "asset-pack-1.0.0-444444444444/data.txt") catch return;
+    defer live_asset.deinit(allocator);
+    let lab = live_asset.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, lab, "1234567890", "1a");
+
+    var dead_old = path::join(allocator, sd, "old-1.0.0-222222222222/bin/old") catch return;
+    defer dead_old.deinit(allocator);
+    let dob = dead_old.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, dob, "1234567890", "2");
+
+    var dead_new = path::join(allocator, sd, "asset-dead-1.0.0-333333333333/data.txt") catch return;
+    defer dead_new.deinit(allocator);
+    let dnb = dead_new.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, dnb, "1234567890", "3");
+
+    var old_dir = path::join(allocator, sd, "old-1.0.0-222222222222") catch return;
+    defer old_dir.deinit(allocator);
+    let odb = old_dir.as_bytes();
+    let _ = process::spawn_wait8(4, "touch", "-t", "202001010000", odb, "", "", "", "");
+
+    var wt_live = path::join(allocator, base_bytes, "wt_live/kugi.toml") catch return;
+    defer wt_live.deinit(allocator);
+    let wlb = wt_live.as_bytes();
+    let live_doc =
+        \\[tools.live]
+        \\version = "1.0.0"
+        \\url = "https://example.com/live"
+        \\bin = ["live"]
+        \\sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+        \\
+        \\[assets.pack]
+        \\version = "1.0.0"
+        \\url = "https://example.com/pack.dat"
+        \\archive = "none"
+        \\sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+    ;
+    let _ = posix::write_file_atomic(handle, allocator, wlb, live_doc, "4");
+
+    var wt_dead = path::join(allocator, base_bytes, "wt_dead/kugi.toml") catch return;
+    defer wt_dead.deinit(allocator);
+    let wdb = wt_dead.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, wdb, live_doc, "5");
+
+    var live_keys = array::new<string::String>(allocator);
+    defer live_keys.deinit(allocator);
+    var dead_keys = array::new<string::String>(allocator);
+    defer dead_keys.deinit(allocator);
+    if string::from_bytes(allocator, "store/live-1.0.0-111111111111") |k1| {
+        live_keys.append(allocator, move k1) catch return;
+    } else |_| {
+        return;
+    }
+    if string::from_bytes(allocator, "store/asset-pack-1.0.0-444444444444") |k1a| {
+        live_keys.append(allocator, move k1a) catch return;
+    } else |_| {
+        return;
+    }
+    if string::from_bytes(allocator, "store/old-1.0.0-222222222222") |k2| {
+        dead_keys.append(allocator, move k2) catch return;
+    } else |_| {
+        return;
+    }
+
+    let _ = roots::register_root(handle, allocator, &paths, wlb, wlb, &live_keys, "r1");
+    let _ = roots::register_root(handle, allocator, &paths, wdb, wdb, &dead_keys, "r2");
+    let _ = posix::unlink_if_exists(allocator, wdb);
+
+    if run_gc(handle, allocator, &paths, true) |dry| {
+        testing::expect_equal<i64>(1, dry.deleted_roots);
+        testing::expect_equal<i64>(2, dry.deleted_entries);
+        testing::expect_equal<i64>(20, dry.freed_bytes);
+    } else |_| {
+        testing::fail("dry-run gc failed");
+    }
+
+    if enforce_budget(handle, allocator, &paths, 32) |lru| {
+        testing::expect_equal<i64>(1, lru.deleted_entries);
+        testing::expect_equal<i64>(10, lru.freed_bytes);
+    } else |_| {
+        testing::fail("enforce_budget failed");
+    }
+    if posix::inspect_path(handle, allocator, odb) |k| {
+        testing::expect(k == posix::PathKind::Missing);
+    } else |_| {
+        testing::fail("inspect old_dir failed");
+    }
+    var new_dir = path::join(allocator, sd, "asset-dead-1.0.0-333333333333") catch return;
+    defer new_dir.deinit(allocator);
+    let ndb = new_dir.as_bytes();
+    if posix::inspect_path(handle, allocator, ndb) |k| {
+        testing::expect(k == posix::PathKind::Dir);
+    } else |_| {
+        testing::fail("newer unreferenced asset entry should remain under budget");
+    }
+
+    if run_gc(handle, allocator, &paths, false) |real| {
+        testing::expect_equal<i64>(1, real.deleted_entries);
+        testing::expect_equal<i64>(2, real.kept_entries);
+    } else |_| {
+        testing::fail("real gc failed");
+    }
+
+    let _ = posix::remove_tree(handle, allocator, base_bytes);
+}

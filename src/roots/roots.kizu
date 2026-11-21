@@ -1,0 +1,215 @@
+import kugi::bytes;
+import kugi::posix;
+import kugi::store;
+import std::array;
+import std::fs;
+import std::json;
+import std::mem;
+import std::path;
+import std::process;
+import std::sort;
+import std::string;
+import std::testing;
+
+pub error Error {
+    InvalidJson,
+    IoFailed,
+    OutOfMemory,
+}
+
+pub struct RootRecord {
+    pub manifest: string::String,
+    pub lockfile: string::String,
+    pub synced_at: i64,
+    pub store_keys: array::Array<string::String>,
+}
+
+pub fn (self: RootRecord) deinit(allocator: Allocator) -> void {
+    self.manifest.deinit(allocator);
+    self.lockfile.deinit(allocator);
+    self.store_keys.deinit(allocator);
+    return;
+}
+
+pub fn bare_store_key(entry: []u8) -> []u8 {
+    if mem::starts_with(entry, "store/") {
+        return entry[6..mem::len(entry)];
+    }
+    return entry;
+}
+
+pub fn decode_root(allocator: Allocator, raw: []u8) -> Error!RootRecord {
+    let rec = json::decode<RootRecord>(allocator, raw) catch return Error::InvalidJson;
+    return move rec;
+}
+
+pub fn encode_root(
+    allocator: Allocator,
+    rec: &RootRecord,
+    out: &var string::String,
+) -> Error!void {
+    var sorted = array::new<string::String>(allocator);
+    defer sorted.deinit(allocator);
+    var i = 0;
+    while rec.store_keys.at(i) |item| {
+        let ib = item.as_bytes();
+        let copy = string::from_bytes(allocator, ib) catch return Error::OutOfMemory;
+        sorted.append(allocator, move copy) catch return Error::OutOfMemory;
+        i = i + 1;
+    }
+    sort::strings(&var sorted) catch return Error::IoFailed;
+
+    var enc = json::encoder_with_spaces(allocator, 2);
+    defer enc.deinit(allocator);
+    enc.begin_object() catch return Error::OutOfMemory;
+    let mb = rec.manifest.as_bytes();
+    let lb = rec.lockfile.as_bytes();
+    enc.write_bytes_field("manifest", mb) catch return Error::OutOfMemory;
+    enc.write_bytes_field("lockfile", lb) catch return Error::OutOfMemory;
+    enc.write_i64_field("synced_at", rec.synced_at) catch return Error::OutOfMemory;
+    enc.begin_array_field("store_keys") catch return Error::OutOfMemory;
+    var j = 0;
+    while sorted.at(j) |k| {
+        let kb = k.as_bytes();
+        enc.write_bytes(kb) catch return Error::OutOfMemory;
+        j = j + 1;
+    }
+    enc.end_array() catch return Error::OutOfMemory;
+    enc.end_object() catch return Error::OutOfMemory;
+    enc.finish_into(allocator, out) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
+    return;
+}
+
+pub fn register_root(
+    handle: Io,
+    allocator: Allocator,
+    paths: &store::Paths,
+    manifest_path: []u8,
+    lockfile_path: []u8,
+    store_keys: &array::Array<string::String>,
+    nonce: []u8,
+) -> Error!void {
+    var canon_manifest = string::new(allocator);
+    defer canon_manifest.deinit(allocator);
+    if fs::real_path(handle, allocator, manifest_path) |rp| {
+        defer rp.deinit(allocator);
+        let rpb = rp.as_bytes();
+        canon_manifest.append_bytes(allocator, rpb) catch return Error::OutOfMemory;
+    } else |_| {
+        let cl = path::clean(allocator, manifest_path) catch return Error::OutOfMemory;
+        defer cl.deinit(allocator);
+        let clb = cl.as_bytes();
+        canon_manifest.append_bytes(allocator, clb) catch return Error::OutOfMemory;
+    }
+    let cmb = canon_manifest.as_bytes();
+
+    var canon_lock = string::new(allocator);
+    defer canon_lock.deinit(allocator);
+    let mdir = path::dirname(cmb);
+    let lock_base = path::basename(lockfile_path);
+    var joined_lock = path::join(allocator, mdir, lock_base) catch return Error::OutOfMemory;
+    defer joined_lock.deinit(allocator);
+    let jlb = joined_lock.as_bytes();
+    canon_lock.append_bytes(allocator, jlb) catch return Error::OutOfMemory;
+
+    var keys_copy = array::new<string::String>(allocator);
+    errdefer keys_copy.deinit(allocator);
+    var i = 0;
+    while store_keys.at(i) |k| {
+        let kb = k.as_bytes();
+        var pref = string::new(allocator);
+        errdefer pref.deinit(allocator);
+        if mem::starts_with(kb, "store/") {
+            pref.append_bytes(allocator, kb) catch return Error::OutOfMemory;
+        } else {
+            pref.append_bytes(allocator, "store/") catch return Error::OutOfMemory;
+            pref.append_bytes(allocator, kb) catch return Error::OutOfMemory;
+        }
+        keys_copy.append(allocator, move pref) catch return Error::OutOfMemory;
+        i = i + 1;
+    }
+
+    var rec_manifest = string::from_bytes(allocator, cmb) catch return Error::OutOfMemory;
+    errdefer rec_manifest.deinit(allocator);
+    let clkb = canon_lock.as_bytes();
+    var rec_lock = string::from_bytes(allocator, clkb) catch return Error::OutOfMemory;
+    errdefer rec_lock.deinit(allocator);
+    var rec = RootRecord {
+        manifest: move rec_manifest,
+        lockfile: move rec_lock,
+        synced_at: process::unix_millis() / 1000,
+        store_keys: move keys_copy,
+    };
+    defer rec.deinit(allocator);
+
+    var encoded = string::new(allocator);
+    defer encoded.deinit(allocator);
+    try encode_root(allocator, &rec, &var encoded);
+
+    var rid = string::new(allocator);
+    defer rid.deinit(allocator);
+    store::format_root_id(allocator, cmb, &var rid) catch return Error::OutOfMemory;
+    rid.append_bytes(allocator, ".json") catch return Error::OutOfMemory;
+    let rid_b = rid.as_bytes();
+    let rdir = paths.roots_dir.as_bytes();
+    var root_file = path::join(allocator, rdir, rid_b) catch return Error::OutOfMemory;
+    defer root_file.deinit(allocator);
+    let rfb = root_file.as_bytes();
+    let enc_b = encoded.as_bytes();
+    posix::write_file_atomic(handle, allocator, rfb, enc_b, nonce) catch return Error::IoFailed;
+    return;
+}
+
+fn root_roundtrip_helper(allocator: Allocator) -> mem::Error!void {
+    var keys = array::new<string::String>(allocator);
+    errdefer keys.deinit(allocator);
+    let k1 = try string::from_bytes(allocator, "store/zig-0.16.0-111111111111");
+    try keys.append(allocator, move k1);
+    let k2 = try string::from_bytes(allocator, "store/rg-14.1.1-222222222222");
+    try keys.append(allocator, move k2);
+
+    var m_str = try string::from_bytes(allocator, "/work/wt1/kugi.toml");
+    errdefer m_str.deinit(allocator);
+    var l_str = try string::from_bytes(allocator, "/work/wt1/kugi.lock");
+    errdefer l_str.deinit(allocator);
+    var rec = RootRecord {
+        manifest: move m_str,
+        lockfile: move l_str,
+        synced_at: 1700000000,
+        store_keys: move keys,
+    };
+    defer rec.deinit(allocator);
+
+    var encoded = string::new(allocator);
+    defer encoded.deinit(allocator);
+    if encode_root(allocator, &rec, &var encoded) {} else |_| {
+        testing::fail("encode_root failed");
+        return;
+    }
+    let text = encoded.as_bytes();
+    let rg_pos = bytes::find_bytes(text, "store/rg-", 0) orelse -1;
+    let zig_pos = bytes::find_bytes(text, "store/zig-", 0) orelse -1;
+    testing::expect(rg_pos >= 0 and zig_pos > rg_pos);
+
+    if decode_root(allocator, text) |dec| {
+        defer dec.deinit(allocator);
+        testing::expect_equal<i64>(1700000000, dec.synced_at);
+        testing::expect_equal<i64>(2, dec.store_keys.len());
+        if dec.store_keys.at(0) |first| {
+            let fb = first.as_bytes();
+            let bare = bare_store_key(fb);
+            testing::expect_equal<[]u8>("rg-14.1.1-222222222222", bare);
+        }
+    } else |_| {
+        testing::fail("decode_root failed");
+    }
+    return;
+}
+
+test "root record encode decode roundtrip" {
+    let allocator = mem::page_allocator();
+    if root_roundtrip_helper(allocator) {} else |_| {
+        testing::fail("root_roundtrip_helper failed");
+    }
+}
