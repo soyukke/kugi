@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-15
+            kizu_target: darwin-arm64
+            kizu_sha256: e0e05678783fd25d3276611857b2e2eb346f3ce5715758447ca26cb33c7e9c74
+            kugi_target: darwin-aarch64
+          - os: ubuntu-latest
+            kizu_target: linux-amd64
+            kizu_sha256: 6477bf6519c1a0d40151e0a19474e3b2b02db1f495da2eaab1b983f1bae9f8b4
+            kugi_target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            kizu_target: linux-arm64
+            kizu_sha256: b287dd18aa2094b003720e60489d9493259401efaf17b7d2778bb93c5e5a7ab0
+            kugi_target: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      KIZU_VERSION: v0.8.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify release tag matches package version
+        run: |
+          python3 - "${GITHUB_REF_NAME}" <<'PY'
+          import pathlib, re, sys
+          tag = sys.argv[1]
+          if not tag.startswith("v"):
+              sys.exit(f"release tag must start with v: {tag}")
+          version = tag[1:]
+          main_src = pathlib.Path("src/main.kizu").read_text(encoding="utf-8")
+          m_main = re.search(r'const VERSION = "([^"]+)"', main_src)
+          toml_src = pathlib.Path("kizu.toml").read_text(encoding="utf-8")
+          m_toml = re.search(r'^version = "([^"]+)"', toml_src, re.MULTILINE)
+          if not m_main or m_main.group(1) != version:
+              sys.exit(f"src/main.kizu VERSION mismatch for tag {tag}")
+          if not m_toml or m_toml.group(1) != version:
+              sys.exit(f"kizu.toml version mismatch for tag {tag}")
+          print(f"version ok: {version}")
+          PY
+      - name: Install Kizu ${{ env.KIZU_VERSION }}
+        env:
+          KIZU_TARGET: ${{ matrix.kizu_target }}
+          KIZU_SHA256: ${{ matrix.kizu_sha256 }}
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/kizu-${KIZU_VERSION}-${KIZU_TARGET}.tar.gz"
+          url="https://github.com/kizu-lang/kizu/releases/download/${KIZU_VERSION}/kizu-${KIZU_VERSION}-${KIZU_TARGET}.tar.gz"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" "$url"
+          python3 - "$archive" "$KIZU_SHA256" <<'PY'
+          import hashlib, pathlib, sys
+          path, expected = sys.argv[1], sys.argv[2]
+          actual = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          if actual != expected:
+              sys.exit(f"sha256 mismatch: expected {expected}, got {actual}")
+          PY
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          prefix="$RUNNER_TEMP/kizu-${KIZU_VERSION}-${KIZU_TARGET}"
+          echo "KIZU=$prefix/bin/kizu" >> "$GITHUB_ENV"
+          echo "KIZU_LIB_DIR=$prefix/lib/kizu" >> "$GITHUB_ENV"
+      - name: Lint, build, and test
+        run: |
+          sh scripts/lint.sh
+          sh scripts/build.sh
+          sh scripts/test-integration.sh
+      - name: Package release archive
+        env:
+          KUGI_TARGET: ${{ matrix.kugi_target }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          pkg="kugi-${version}-${KUGI_TARGET}"
+          stage="$RUNNER_TEMP/pkg/$pkg"
+          mkdir -p "$stage" out
+          cp dist/kugi "$stage/kugi"
+          chmod 0755 "$stage/kugi"
+          cp LICENSE README.md "$stage/"
+          tar -czf "out/${pkg}.tar.gz" -C "$RUNNER_TEMP/pkg" "$pkg"
+          ls -lh "out/${pkg}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kugi-${{ matrix.kugi_target }}
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd release-assets
+          sha256sum kugi-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "${GITHUB_REF_NAME}" kugi-*.tar.gz SHA256SUMS.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
