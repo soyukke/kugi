@@ -70,3 +70,10 @@ echo "==> Checking Kizu package"
 
 echo "==> Running Kizu tests"
 "$KIZU" test .
+
+echo "==> Checking TLA+ specs against std::machine"
+"$KIZU" run . -- --dump-machines | python3 scripts/machine-tla.py --check \
+  spec/store_publish.tla \
+  spec/fetch_transport.tla \
+  spec/link_guard.tla
+echo "spec-drift: ok"

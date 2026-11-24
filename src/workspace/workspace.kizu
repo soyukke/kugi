@@ -11,6 +11,7 @@ import std::array;
 import std::fmt;
 import std::fs;
 import std::io;
+import std::machine;
 import std::map;
 import std::mem;
 import std::path;
@@ -30,6 +31,73 @@ pub error Error {
     StoreFailed,
     IoFailed,
     OutOfMemory,
+}
+
+pub enum LinkState {
+    Inspecting,
+    Unchanged,
+    Linked,
+    Refused,
+}
+
+pub enum LinkEvent {
+    Missing,
+    SymlinkSame,
+    SymlinkOther,
+    RegularFileNoForce,
+    RegularFileForce,
+    DirNoForce,
+    DirForce,
+}
+
+pub enum LinkOutcome {
+    Applied,
+    RefusedOverwrite,
+    NoOp,
+    Rejected,
+}
+
+pub struct LinkStep {
+    pub state: LinkState,
+    pub outcome: LinkOutcome,
+}
+
+pub fn is_link_end(state: LinkState) -> bool {
+    return state == LinkState::Unchanged or state == LinkState::Linked or state == LinkState::Refused;
+}
+
+pub fn advance_link(state: LinkState, event: LinkEvent) -> LinkStep {
+    if state == LinkState::Inspecting {
+        if event == LinkEvent::SymlinkSame {
+            return LinkStep { state: LinkState::Unchanged, outcome: LinkOutcome::NoOp };
+        }
+        if event == LinkEvent::Missing or event == LinkEvent::SymlinkOther or event == LinkEvent::RegularFileForce or event == LinkEvent::DirForce {
+            return LinkStep { state: LinkState::Linked, outcome: LinkOutcome::Applied };
+        }
+        if event == LinkEvent::RegularFileNoForce or event == LinkEvent::DirNoForce {
+            return LinkStep { state: LinkState::Refused, outcome: LinkOutcome::RefusedOverwrite };
+        }
+        return LinkStep { state: LinkState::Refused, outcome: LinkOutcome::Rejected };
+    }
+    return LinkStep { state: state, outcome: LinkOutcome::Rejected };
+}
+
+fn link_next(state: LinkState, event: LinkEvent) -> LinkState {
+    return advance_link(state, event).state;
+}
+
+fn link_outcome(state: LinkState, event: LinkEvent) -> LinkOutcome {
+    return advance_link(state, event).outcome;
+}
+
+pub fn link_machine_table(allocator: Allocator) -> mem::Error!machine::Table {
+    return machine::answers<LinkState, LinkEvent, LinkOutcome>(
+        allocator,
+        link_next,
+        link_outcome,
+        LinkState::Inspecting,
+        is_link_end,
+    );
 }
 
 fn set_msg(allocator: Allocator, diag: &var string::String, msg: []u8) -> void {
@@ -341,43 +409,53 @@ pub fn apply_links(
             }
 
             let kind = posix::inspect_path(handle, allocator, dab) catch return Error::IoFailed;
+            var link_ev = LinkEvent::Missing;
             if kind == posix::PathKind::Symlink {
                 var current_target = string::new(allocator);
                 defer current_target.deinit(allocator);
                 let _ = posix::read_symlink(allocator, dab, &var current_target) catch return Error::IoFailed;
                 let ctb = current_target.as_bytes();
                 if mem::equal_bytes(ctb, sab) {
-                    idx = idx + 1;
-                    continue;
+                    link_ev = LinkEvent::SymlinkSame;
+                } else {
+                    link_ev = LinkEvent::SymlinkOther;
                 }
-                var nonce = string::new(allocator);
-                defer nonce.deinit(allocator);
-                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
-                let nb = nonce.as_bytes();
-                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to update symlink");
             } else if kind == posix::PathKind::Missing {
-                var nonce = string::new(allocator);
-                defer nonce.deinit(allocator);
-                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
-                let nb = nonce.as_bytes();
-                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create symlink");
+                link_ev = LinkEvent::Missing;
+            } else if kind == posix::PathKind::Dir {
+                if force {
+                    link_ev = LinkEvent::DirForce;
+                } else {
+                    link_ev = LinkEvent::DirNoForce;
+                }
             } else {
-                if !force {
-                    diag.clear();
-                    diag.append_bytes(allocator, "refusing to overwrite non-symlink path '") catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, dab) catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, "' (re-run with --force to replace)") catch return Error::OutOfMemory;
-                    return Error::LinkConflict;
+                if force {
+                    link_ev = LinkEvent::RegularFileForce;
+                } else {
+                    link_ev = LinkEvent::RegularFileNoForce;
                 }
-                if kind == posix::PathKind::Dir {
-                    posix::remove_tree(handle, allocator, dab) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to remove directory under --force");
-                }
-                var nonce = string::new(allocator);
-                defer nonce.deinit(allocator);
-                store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
-                let nb = nonce.as_bytes();
-                posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to replace path with symlink");
             }
+
+            let step = advance_link(LinkState::Inspecting, link_ev);
+            if step.state == LinkState::Unchanged {
+                idx = idx + 1;
+                continue;
+            }
+            if step.state == LinkState::Refused {
+                diag.clear();
+                diag.append_bytes(allocator, "refusing to overwrite non-symlink path '") catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, dab) catch return Error::OutOfMemory;
+                diag.append_bytes(allocator, "' (re-run with --force to replace)") catch return Error::OutOfMemory;
+                return Error::LinkConflict;
+            }
+            if link_ev == LinkEvent::DirForce {
+                posix::remove_tree(handle, allocator, dab) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to remove directory under --force");
+            }
+            var nonce = string::new(allocator);
+            defer nonce.deinit(allocator);
+            store::make_nonce(allocator, idx + 1, &var nonce) catch return Error::OutOfMemory;
+            let nb = nonce.as_bytes();
+            posix::atomic_symlink(allocator, sab, dab, nb) catch return fail_msg(allocator, diag, Error::IoFailed, "failed to create symlink");
         }
         idx = idx + 1;
     }
@@ -1595,4 +1673,31 @@ test "format_download_error includes specific failure reasons" {
         0,
         "failed to download 'demo' from https://example.com/a.tgz: no trusted CA certificates found",
     );
+}
+
+test "link guard machine is sound" {
+    let allocator = mem::page_allocator();
+    if link_machine_table(allocator) |table| {
+        defer table.deinit(allocator);
+        if table.problems(allocator) |problems| {
+            defer problems.deinit(allocator);
+            if problems.at(0) |line| {
+                let lb = line.as_bytes();
+                testing::fail(lb);
+            }
+        } else |_| {
+            testing::fail("problems failed");
+        }
+        var i = 0;
+        while table.moves.at(i) |mv| {
+            if mem::equal_bytes(mv.from, "Inspecting")
+                and (mem::equal_bytes(mv.event, "RegularFileNoForce") or mem::equal_bytes(mv.event, "DirNoForce")) {
+                testing::expect_equal<[]u8>("Refused", mv.to);
+                testing::expect_equal<[]u8>("RefusedOverwrite", mv.outcome);
+            }
+            i = i + 1;
+        }
+    } else |_| {
+        testing::fail("link_machine_table failed");
+    }
 }

@@ -6,6 +6,7 @@ import std::array;
 import std::fmt;
 import std::fs;
 import std::io;
+import std::machine;
 import std::mem;
 import std::path;
 import std::process;
@@ -19,6 +20,111 @@ pub error Error {
     ArchiveFailed,
     IoFailed,
     OutOfMemory,
+}
+
+pub enum PublishState {
+    Unlocked,
+    Locked,
+    PartReady,
+    HashVerified,
+    Staged,
+    Published,
+    Aborted,
+}
+
+pub enum PublishEvent {
+    AcquireLock,
+    EntryPresent,
+    DownloadOk,
+    DownloadFail,
+    HashMatch,
+    HashMismatch,
+    StageOk,
+    StageFail,
+    RenameOk,
+    RenameLostRace,
+    RenameFail,
+}
+
+pub enum PublishOutcome {
+    Applied,
+    Rejected,
+}
+
+pub struct PublishStep {
+    pub state: PublishState,
+    pub outcome: PublishOutcome,
+}
+
+pub fn is_publish_end(state: PublishState) -> bool {
+    return state == PublishState::Published or state == PublishState::Aborted;
+}
+
+pub fn advance_publish(state: PublishState, event: PublishEvent) -> PublishStep {
+    if state == PublishState::Unlocked {
+        if event == PublishEvent::AcquireLock {
+            return PublishStep { state: PublishState::Locked, outcome: PublishOutcome::Applied };
+        }
+        return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Rejected };
+    }
+    if state == PublishState::Locked {
+        if event == PublishEvent::EntryPresent {
+            return PublishStep { state: PublishState::Published, outcome: PublishOutcome::Applied };
+        }
+        if event == PublishEvent::DownloadOk {
+            return PublishStep { state: PublishState::PartReady, outcome: PublishOutcome::Applied };
+        }
+        if event == PublishEvent::DownloadFail {
+            return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Applied };
+        }
+        return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Rejected };
+    }
+    if state == PublishState::PartReady {
+        if event == PublishEvent::HashMatch {
+            return PublishStep { state: PublishState::HashVerified, outcome: PublishOutcome::Applied };
+        }
+        if event == PublishEvent::HashMismatch {
+            return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Applied };
+        }
+        return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Rejected };
+    }
+    if state == PublishState::HashVerified {
+        if event == PublishEvent::StageOk {
+            return PublishStep { state: PublishState::Staged, outcome: PublishOutcome::Applied };
+        }
+        if event == PublishEvent::StageFail {
+            return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Applied };
+        }
+        return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Rejected };
+    }
+    if state == PublishState::Staged {
+        if event == PublishEvent::RenameOk or event == PublishEvent::RenameLostRace {
+            return PublishStep { state: PublishState::Published, outcome: PublishOutcome::Applied };
+        }
+        if event == PublishEvent::RenameFail {
+            return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Applied };
+        }
+        return PublishStep { state: PublishState::Aborted, outcome: PublishOutcome::Rejected };
+    }
+    return PublishStep { state: state, outcome: PublishOutcome::Rejected };
+}
+
+fn publish_next(state: PublishState, event: PublishEvent) -> PublishState {
+    return advance_publish(state, event).state;
+}
+
+fn publish_outcome(state: PublishState, event: PublishEvent) -> PublishOutcome {
+    return advance_publish(state, event).outcome;
+}
+
+pub fn publish_machine_table(allocator: Allocator) -> mem::Error!machine::Table {
+    return machine::answers<PublishState, PublishEvent, PublishOutcome>(
+        allocator,
+        publish_next,
+        publish_outcome,
+        PublishState::Unlocked,
+        is_publish_end,
+    );
 }
 
 pub struct Paths {
@@ -325,6 +431,7 @@ pub fn publish_verified_file(
     defer final_target.deinit(allocator);
     let ftb = final_target.as_bytes();
 
+    var pub_state = PublishState::PartReady;
     var actual = string::new(allocator);
     defer actual.deinit(allocator);
     if posix::hash_file_sha256(allocator, part_path, &var actual) {} else |_| {
@@ -332,7 +439,13 @@ pub fn publish_verified_file(
         return Error::IoFailed;
     }
     let actual_b = actual.as_bytes();
-    if !hash::equal_digest(actual_b, expected_sha) {
+    let hash_ev = if hash::equal_digest(actual_b, expected_sha) {
+        PublishEvent::HashMatch
+    } else {
+        PublishEvent::HashMismatch
+    };
+    pub_state = advance_publish(pub_state, hash_ev).state;
+    if pub_state != PublishState::HashVerified {
         out_actual_sha.clear();
         out_actual_sha.append_bytes(allocator, actual_b) catch return Error::OutOfMemory;
         let _ = posix::unlink_if_exists(allocator, part_path);
@@ -347,29 +460,48 @@ pub fn publish_verified_file(
     let td = paths.tmp_dir.as_bytes();
     var staged_dir = string::new(allocator);
     defer staged_dir.deinit(allocator);
-    if archive::stage_store_entry(handle, allocator, part_path, url_hint, tool, td, nb, &var staged_dir) {} else |_| {
+    if archive::stage_store_entry(handle, allocator, part_path, url_hint, tool, td, nb, &var staged_dir) {
+        pub_state = advance_publish(pub_state, PublishEvent::StageOk).state;
+    } else |_| {
+        pub_state = advance_publish(pub_state, PublishEvent::StageFail).state;
         let _ = posix::unlink_if_exists(allocator, part_path);
         return Error::ArchiveFailed;
     }
     let _ = posix::unlink_if_exists(allocator, part_path);
     let staged_b = staged_dir.as_bytes();
+    if pub_state != PublishState::Staged {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        return Error::ArchiveFailed;
+    }
 
     let existing_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
     if existing_kind == posix::PathKind::Dir {
         let _ = posix::remove_tree(handle, allocator, staged_b);
-        posix::touch_now(allocator, ftb);
-        return;
+        pub_state = advance_publish(pub_state, PublishEvent::RenameLostRace).state;
+        if pub_state == PublishState::Published {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
     }
     if posix::rename_path(allocator, staged_b, ftb) {
-        posix::touch_now(allocator, ftb);
-        return;
+        pub_state = advance_publish(pub_state, PublishEvent::RenameOk).state;
+        if pub_state == PublishState::Published {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
     } else |_| {
         let _ = posix::remove_tree(handle, allocator, staged_b);
         let after_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
         if after_kind == posix::PathKind::Dir {
-            posix::touch_now(allocator, ftb);
-            return;
+            pub_state = advance_publish(pub_state, PublishEvent::RenameLostRace).state;
+            if pub_state == PublishState::Published {
+                posix::touch_now(allocator, ftb);
+                return;
+            }
         }
+        let _ = advance_publish(pub_state, PublishEvent::RenameFail);
         return Error::IoFailed;
     }
 }
@@ -395,6 +527,7 @@ pub fn publish_verified_asset_file(
     defer final_target.deinit(allocator);
     let ftb = final_target.as_bytes();
 
+    var pub_state = PublishState::PartReady;
     var actual = string::new(allocator);
     defer actual.deinit(allocator);
     if posix::hash_file_sha256(allocator, part_path, &var actual) {} else |_| {
@@ -402,7 +535,13 @@ pub fn publish_verified_asset_file(
         return Error::IoFailed;
     }
     let actual_b = actual.as_bytes();
-    if !hash::equal_digest(actual_b, expected_sha) {
+    let hash_ev = if hash::equal_digest(actual_b, expected_sha) {
+        PublishEvent::HashMatch
+    } else {
+        PublishEvent::HashMismatch
+    };
+    pub_state = advance_publish(pub_state, hash_ev).state;
+    if pub_state != PublishState::HashVerified {
         out_actual_sha.clear();
         out_actual_sha.append_bytes(allocator, actual_b) catch return Error::OutOfMemory;
         let _ = posix::unlink_if_exists(allocator, part_path);
@@ -417,29 +556,48 @@ pub fn publish_verified_asset_file(
     let td = paths.tmp_dir.as_bytes();
     var staged_dir = string::new(allocator);
     defer staged_dir.deinit(allocator);
-    if archive::stage_asset_entry(handle, allocator, part_path, url_hint, asset, td, nb, &var staged_dir) {} else |_| {
+    if archive::stage_asset_entry(handle, allocator, part_path, url_hint, asset, td, nb, &var staged_dir) {
+        pub_state = advance_publish(pub_state, PublishEvent::StageOk).state;
+    } else |_| {
+        pub_state = advance_publish(pub_state, PublishEvent::StageFail).state;
         let _ = posix::unlink_if_exists(allocator, part_path);
         return Error::ArchiveFailed;
     }
     let _ = posix::unlink_if_exists(allocator, part_path);
     let staged_b = staged_dir.as_bytes();
+    if pub_state != PublishState::Staged {
+        let _ = posix::remove_tree(handle, allocator, staged_b);
+        return Error::ArchiveFailed;
+    }
 
     let existing_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
     if existing_kind == posix::PathKind::Dir {
         let _ = posix::remove_tree(handle, allocator, staged_b);
-        posix::touch_now(allocator, ftb);
-        return;
+        pub_state = advance_publish(pub_state, PublishEvent::RenameLostRace).state;
+        if pub_state == PublishState::Published {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
     }
     if posix::rename_path(allocator, staged_b, ftb) {
-        posix::touch_now(allocator, ftb);
-        return;
+        pub_state = advance_publish(pub_state, PublishEvent::RenameOk).state;
+        if pub_state == PublishState::Published {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
     } else |_| {
         let _ = posix::remove_tree(handle, allocator, staged_b);
         let after_kind = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
         if after_kind == posix::PathKind::Dir {
-            posix::touch_now(allocator, ftb);
-            return;
+            pub_state = advance_publish(pub_state, PublishEvent::RenameLostRace).state;
+            if pub_state == PublishState::Published {
+                posix::touch_now(allocator, ftb);
+                return;
+            }
         }
+        let _ = advance_publish(pub_state, PublishEvent::RenameFail);
         return Error::IoFailed;
     }
 }
@@ -951,4 +1109,33 @@ test "store hash verification publish and bootstrap no-clobber" {
     }
 
     let _ = posix::remove_tree(handle, allocator, base_bytes);
+}
+
+test "store publish machine is sound" {
+    let allocator = mem::page_allocator();
+    if publish_machine_table(allocator) |table| {
+        defer table.deinit(allocator);
+        if table.problems(allocator) |problems| {
+            defer problems.deinit(allocator);
+            if problems.at(0) |line| {
+                let lb = line.as_bytes();
+                testing::fail(lb);
+            }
+        } else |_| {
+            testing::fail("problems failed");
+        }
+        var i = 0;
+        while table.moves.at(i) |mv| {
+            if mem::equal_bytes(mv.to, "Staged") and !mem::equal_bytes(mv.from, "Staged") {
+                testing::expect_equal<[]u8>("HashVerified", mv.from);
+                testing::expect_equal<[]u8>("StageOk", mv.event);
+            }
+            if mem::equal_bytes(mv.from, "PartReady") and mem::equal_bytes(mv.event, "HashMismatch") {
+                testing::expect_equal<[]u8>("Aborted", mv.to);
+            }
+            i = i + 1;
+        }
+    } else |_| {
+        testing::fail("publish_machine_table failed");
+    }
 }

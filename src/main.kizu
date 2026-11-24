@@ -1,4 +1,5 @@
 import kugi::bytes;
+import kugi::fetch;
 import kugi::gc;
 import kugi::lockfile;
 import kugi::manifest;
@@ -8,6 +9,7 @@ import kugi::workspace;
 import std;
 import std::array;
 import std::fmt;
+import std::machine;
 import std::mem;
 import std::process;
 import std::string;
@@ -404,6 +406,30 @@ fn handle_gc(io: Io, allocator: Allocator, argc: i64) -> !process::ExitStatus {
     }
 }
 
+fn write_machine_table(io: Io, allocator: Allocator, table: &machine::Table) -> !void {
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    try table.to_json(allocator, &var out);
+    let text = out.as_bytes();
+    try std::io::write_stdout(io, text);
+    return;
+}
+
+fn handle_dump_machines(io: Io, allocator: Allocator) -> !process::ExitStatus {
+    let publish = try store::publish_machine_table(allocator);
+    defer publish.deinit(allocator);
+    try write_machine_table(io, allocator, &publish);
+
+    let transport = try fetch::fetch_machine_table(allocator);
+    defer transport.deinit(allocator);
+    try write_machine_table(io, allocator, &transport);
+
+    let link = try workspace::link_machine_table(allocator);
+    defer link.deinit(allocator);
+    try write_machine_table(io, allocator, &link);
+    return process::ExitStatus::Success;
+}
+
 fn main() -> !process::ExitStatus {
     let io = std::io::blocking();
     let allocator = mem::page_allocator();
@@ -414,6 +440,9 @@ fn main() -> !process::ExitStatus {
     }
 
     let first = try process::arg(0);
+    if mem::equal_bytes(first, "--dump-machines") {
+        return handle_dump_machines(io, allocator);
+    }
     if is_version_flag(first) {
         try std::io::write_stdout_line(io, format_version());
         return process::ExitStatus::Success;

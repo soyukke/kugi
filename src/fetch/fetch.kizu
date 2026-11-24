@@ -7,6 +7,7 @@ import std::fmt;
 import std::fs;
 import std::http;
 import std::io;
+import std::machine;
 import std::mem;
 import std::path;
 import std::process;
@@ -22,6 +23,115 @@ pub error Error {
     NetworkFailed,
     IoFailed,
     OutOfMemory,
+}
+
+pub enum FetchState {
+    Init,
+    NativeHttp,
+    NativeHttps,
+    CurlHttps,
+    Done,
+    Failed,
+}
+
+pub enum FetchEvent {
+    StartHttp,
+    StartHttps,
+    Http200,
+    RedirectHttp,
+    RedirectHttps,
+    RedirectLimit,
+    HttpError,
+    TlsOrNetError,
+    CurlOk,
+    CurlError,
+}
+
+pub enum FetchOutcome {
+    Applied,
+    Rejected,
+}
+
+pub struct FetchStep {
+    pub state: FetchState,
+    pub outcome: FetchOutcome,
+}
+
+pub fn is_fetch_end(state: FetchState) -> bool {
+    return state == FetchState::Done or state == FetchState::Failed;
+}
+
+pub fn advance_fetch(state: FetchState, event: FetchEvent) -> FetchStep {
+    if state == FetchState::Init {
+        if event == FetchEvent::StartHttp {
+            return FetchStep { state: FetchState::NativeHttp, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::StartHttps {
+            return FetchStep { state: FetchState::NativeHttps, outcome: FetchOutcome::Applied };
+        }
+        return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Rejected };
+    }
+    if state == FetchState::NativeHttp {
+        if event == FetchEvent::Http200 {
+            return FetchStep { state: FetchState::Done, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectHttp {
+            return FetchStep { state: FetchState::NativeHttp, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectHttps {
+            return FetchStep { state: FetchState::NativeHttps, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectLimit or event == FetchEvent::HttpError or event == FetchEvent::TlsOrNetError {
+            return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Applied };
+        }
+        return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Rejected };
+    }
+    if state == FetchState::NativeHttps {
+        if event == FetchEvent::Http200 {
+            return FetchStep { state: FetchState::Done, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectHttps {
+            return FetchStep { state: FetchState::NativeHttps, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectHttp {
+            return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Rejected };
+        }
+        if event == FetchEvent::TlsOrNetError {
+            return FetchStep { state: FetchState::CurlHttps, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::RedirectLimit or event == FetchEvent::HttpError {
+            return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Applied };
+        }
+        return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Rejected };
+    }
+    if state == FetchState::CurlHttps {
+        if event == FetchEvent::CurlOk {
+            return FetchStep { state: FetchState::Done, outcome: FetchOutcome::Applied };
+        }
+        if event == FetchEvent::CurlError {
+            return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Applied };
+        }
+        return FetchStep { state: FetchState::Failed, outcome: FetchOutcome::Rejected };
+    }
+    return FetchStep { state: state, outcome: FetchOutcome::Rejected };
+}
+
+fn fetch_next(state: FetchState, event: FetchEvent) -> FetchState {
+    return advance_fetch(state, event).state;
+}
+
+fn fetch_outcome(state: FetchState, event: FetchEvent) -> FetchOutcome {
+    return advance_fetch(state, event).outcome;
+}
+
+pub fn fetch_machine_table(allocator: Allocator) -> mem::Error!machine::Table {
+    return machine::answers<FetchState, FetchEvent, FetchOutcome>(
+        allocator,
+        fetch_next,
+        fetch_outcome,
+        FetchState::Init,
+        is_fetch_end,
+    );
 }
 
 enum HopOutcome {
@@ -271,7 +381,9 @@ fn finish_native_response(
     out_status.* = resp.status;
 
     if is_redirect_status(resp.status) {
+        let cur_state = if parsed.secure { FetchState::NativeHttps } else { FetchState::NativeHttp };
         if hops == 10 {
+            let _ = advance_fetch(cur_state, FetchEvent::RedirectLimit);
             return Error::TooManyRedirects;
         }
         out_next_url.clear();
@@ -282,13 +394,21 @@ fn finish_native_response(
             return Error::InvalidUrl;
         }
         let next_bytes = out_next_url.as_bytes();
-        if parsed.secure and !starts_with_ascii_fold(next_bytes, "https://") {
+        let redir_ev = if starts_with_ascii_fold(next_bytes, "https://") {
+            FetchEvent::RedirectHttps
+        } else {
+            FetchEvent::RedirectHttp
+        };
+        let step = advance_fetch(cur_state, redir_ev);
+        if step.state == FetchState::Failed {
             return Error::InsecureRedirect;
         }
         return HopOutcome::Redirect;
     }
 
+    let cur_state = if parsed.secure { FetchState::NativeHttps } else { FetchState::NativeHttp };
     if resp.status != 200 {
+        let _ = advance_fetch(cur_state, FetchEvent::HttpError);
         return Error::HttpStatus;
     }
 
@@ -343,12 +463,13 @@ fn try_native_hop(
     out_sha256: &var string::String,
     out_status: &var i64,
 ) -> Error!HopOutcome {
+    let cur_state = if parsed.secure { FetchState::NativeHttps } else { FetchState::NativeHttp };
     if open_url_connection(handle, allocator, parsed, roots, roots_loaded, used_env_ca, limits) |opened| {
         var conn = move opened;
         defer conn.deinit(allocator);
 
         if conn.send_with(handle, allocator, "GET", parsed, headers, "", limits.write_millis) {} else |_| {
-            if parsed.secure {
+            if advance_fetch(cur_state, FetchEvent::TlsOrNetError).state == FetchState::CurlHttps {
                 return HopOutcome::FallbackCurl;
             }
             return Error::NetworkFailed;
@@ -369,13 +490,13 @@ fn try_native_hop(
                 out_status,
             );
         } else |_| {
-            if parsed.secure {
+            if advance_fetch(cur_state, FetchEvent::TlsOrNetError).state == FetchState::CurlHttps {
                 return HopOutcome::FallbackCurl;
             }
             return Error::NetworkFailed;
         }
     } else |err| {
-        if parsed.secure and err == Error::NetworkFailed {
+        if err == Error::NetworkFailed and advance_fetch(cur_state, FetchEvent::TlsOrNetError).state == FetchState::CurlHttps {
             return HopOutcome::FallbackCurl;
         }
         return err;
@@ -949,5 +1070,35 @@ test "system CA root loader parses PEM bundle and rejects broken override" {
     } else |err| {
         testing::expect(err == Error::NoTrustedRoots);
         testing::expect(!used_env);
+    }
+}
+
+test "fetch transport machine is sound" {
+    let allocator = mem::page_allocator();
+    if fetch_machine_table(allocator) |table| {
+        defer table.deinit(allocator);
+        if table.problems(allocator) |problems| {
+            defer problems.deinit(allocator);
+            if problems.at(0) |line| {
+                let lb = line.as_bytes();
+                testing::fail(lb);
+            }
+        } else |_| {
+            testing::fail("problems failed");
+        }
+        var i = 0;
+        while table.moves.at(i) |mv| {
+            if mem::equal_bytes(mv.from, "NativeHttps") and mem::equal_bytes(mv.event, "RedirectHttp") {
+                testing::expect_equal<[]u8>("Failed", mv.to);
+                testing::expect_equal<[]u8>("Rejected", mv.outcome);
+            }
+            if mem::equal_bytes(mv.to, "CurlHttps") and !mem::equal_bytes(mv.from, "CurlHttps") {
+                testing::expect_equal<[]u8>("NativeHttps", mv.from);
+                testing::expect_equal<[]u8>("TlsOrNetError", mv.event);
+            }
+            i = i + 1;
+        }
+    } else |_| {
+        testing::fail("fetch_machine_table failed");
     }
 }

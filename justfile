@@ -22,3 +22,9 @@ test-integration:
 
 build:
     sh scripts/build.sh
+
+spec-gen:
+    sh scripts/spec-gen.sh
+
+spec-verify:
+    sh scripts/spec-verify.sh
