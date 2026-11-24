@@ -4,12 +4,14 @@ import kugi::hash;
 import kugi::lockfile;
 import kugi::manifest;
 import kugi::posix;
+import kugi::resolve;
 import kugi::roots;
 import kugi::store;
 import std::array;
 import std::fmt;
 import std::fs;
 import std::io;
+import std::map;
 import std::mem;
 import std::path;
 import std::process;
@@ -237,10 +239,20 @@ pub fn load_lockfile_optional(
     return move lf;
 }
 
-fn strings_equal(a: &string::String, b: &string::String) -> bool {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
-    return mem::equal_bytes(ab, bb);
+fn map_resolve_err(err: resolve::Error) -> Error {
+    if err == resolve::Error::ManifestInvalid {
+        return Error::ManifestInvalid;
+    }
+    if err == resolve::Error::UsageError {
+        return Error::UsageError;
+    }
+    if err == resolve::Error::Unlocked {
+        return Error::Unlocked;
+    }
+    if err == resolve::Error::OutOfMemory {
+        return Error::OutOfMemory;
+    }
+    return Error::IoFailed;
 }
 
 pub fn resolve_tool_lock(
@@ -252,35 +264,11 @@ pub fn resolve_tool_lock(
     out_url: &var string::String,
     out_sha: &var string::String,
 ) -> Error!bool {
-    out_url.clear();
-    out_sha.clear();
-    if tool.has_sha256 {
-        manifest::resolve_tool_url(allocator, tool, os, arch, out_url) catch return Error::OutOfMemory;
-        let sb = tool.sha256.as_bytes();
-        out_sha.append_bytes(allocator, sb) catch return Error::OutOfMemory;
-        return true;
+    if resolve::resolve_tool_lock(allocator, tool, lf, os, arch, out_url, out_sha) |ok| {
+        return ok;
+    } else |err| {
+        return map_resolve_err(err);
     }
-    var target_key = string::new(allocator);
-    defer target_key.deinit(allocator);
-    target_key.append_bytes(allocator, os) catch return Error::OutOfMemory;
-    target_key.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
-    target_key.append_bytes(allocator, arch) catch return Error::OutOfMemory;
-    let tkb = target_key.as_bytes();
-    let tname = tool.name.as_bytes();
-    let tver = tool.version.as_bytes();
-    let matched = lockfile::lookup_target(allocator, lf, tname, tver, tkb, out_url, out_sha) catch return Error::OutOfMemory;
-    if !matched {
-        return false;
-    }
-    var expected_url = string::new(allocator);
-    defer expected_url.deinit(allocator);
-    manifest::resolve_tool_url(allocator, tool, os, arch, &var expected_url) catch return Error::OutOfMemory;
-    if !strings_equal(&expected_url, out_url) {
-        out_url.clear();
-        out_sha.clear();
-        return false;
-    }
-    return true;
 }
 
 pub fn resolve_asset_lock(
@@ -292,35 +280,11 @@ pub fn resolve_asset_lock(
     out_url: &var string::String,
     out_sha: &var string::String,
 ) -> Error!bool {
-    out_url.clear();
-    out_sha.clear();
-    if asset.has_sha256 {
-        manifest::resolve_asset_url(allocator, asset, os, arch, out_url) catch return Error::OutOfMemory;
-        let sb = asset.sha256.as_bytes();
-        out_sha.append_bytes(allocator, sb) catch return Error::OutOfMemory;
-        return true;
+    if resolve::resolve_asset_lock(allocator, asset, lf, os, arch, out_url, out_sha) |ok| {
+        return ok;
+    } else |err| {
+        return map_resolve_err(err);
     }
-    var target_key = string::new(allocator);
-    defer target_key.deinit(allocator);
-    target_key.append_bytes(allocator, os) catch return Error::OutOfMemory;
-    target_key.append_byte(allocator, cast<u8>(45)) catch return Error::OutOfMemory;
-    target_key.append_bytes(allocator, arch) catch return Error::OutOfMemory;
-    let tkb = target_key.as_bytes();
-    let aname = asset.name.as_bytes();
-    let aver = asset.version.as_bytes();
-    let matched = lockfile::lookup_asset_target(allocator, lf, aname, aver, tkb, out_url, out_sha) catch return Error::OutOfMemory;
-    if !matched {
-        return false;
-    }
-    var expected_url = string::new(allocator);
-    defer expected_url.deinit(allocator);
-    manifest::resolve_asset_url(allocator, asset, os, arch, &var expected_url) catch return Error::OutOfMemory;
-    if !strings_equal(&expected_url, out_url) {
-        out_url.clear();
-        out_sha.clear();
-        return false;
-    }
-    return true;
 }
 
 pub fn resolve_user_path(
@@ -330,21 +294,9 @@ pub fn resolve_user_path(
     base_dir: []u8,
     out: &var string::String,
 ) -> Error!void {
-    var expanded = string::new(allocator);
-    defer expanded.deinit(allocator);
-    bytes::expand_tilde(allocator, raw, home_dir, &var expanded) catch return Error::OutOfMemory;
-    let eb = expanded.as_bytes();
-    if mem::len(eb) > 0 and eb[0] == cast<u8>(47) {
-        let cleaned = path::clean(allocator, eb) catch return Error::OutOfMemory;
-        defer cleaned.deinit(allocator);
-        let cb = cleaned.as_bytes();
-        out.append_bytes(allocator, cb) catch return Error::OutOfMemory;
-        return;
+    if resolve::resolve_user_path(allocator, raw, home_dir, base_dir, out) {} else |err| {
+        return map_resolve_err(err);
     }
-    let joined = path::join(allocator, base_dir, eb) catch return Error::OutOfMemory;
-    defer joined.deinit(allocator);
-    let jb = joined.as_bytes();
-    out.append_bytes(allocator, jb) catch return Error::OutOfMemory;
     return;
 }
 
@@ -468,6 +420,53 @@ fn update_global_bin_links(
     return;
 }
 
+fn update_global_wrapper_bin_link(
+    allocator: Allocator,
+    paths: &store::Paths,
+    wrapper_name: []u8,
+    store_key: []u8,
+    seq: i64,
+) -> Error!void {
+    let sd = paths.store_dir.as_bytes();
+    let bd = paths.bin_dir.as_bytes();
+    var target = string::new(allocator);
+    defer target.deinit(allocator);
+    target.append_bytes(allocator, sd) catch return Error::OutOfMemory;
+    target.append_byte(allocator, cast<u8>(47)) catch return Error::OutOfMemory;
+    target.append_bytes(allocator, store_key) catch return Error::OutOfMemory;
+    target.append_bytes(allocator, "/bin/") catch return Error::OutOfMemory;
+    target.append_bytes(allocator, wrapper_name) catch return Error::OutOfMemory;
+
+    var linkpath = path::join(allocator, bd, wrapper_name) catch return Error::OutOfMemory;
+    defer linkpath.deinit(allocator);
+    var nonce = string::new(allocator);
+    defer nonce.deinit(allocator);
+    store::make_nonce(allocator, seq * 100 + 50, &var nonce) catch return Error::OutOfMemory;
+    let tb = target.as_bytes();
+    let lb = linkpath.as_bytes();
+    let nb = nonce.as_bytes();
+    posix::atomic_symlink(allocator, tb, lb, nb) catch return Error::IoFailed;
+    return;
+}
+
+fn append_unique_store_key(
+    allocator: Allocator,
+    store_keys: &var array::Array<string::String>,
+    key_bytes: []u8,
+) -> Error!void {
+    var i = 0;
+    while store_keys.at(i) |existing| {
+        let eb = existing.as_bytes();
+        if mem::equal_bytes(eb, key_bytes) {
+            return;
+        }
+        i = i + 1;
+    }
+    let copy = string::from_bytes(allocator, key_bytes) catch return Error::OutOfMemory;
+    store_keys.append(allocator, move copy) catch return Error::OutOfMemory;
+    return;
+}
+
 fn format_download_error(
     allocator: Allocator,
     diag: &var string::String,
@@ -499,7 +498,6 @@ fn publish_locked_part(
     diag: &var string::String,
 ) -> Error!void {
     let tname = tool.name.as_bytes();
-    let tver = tool.version.as_bytes();
     let sd = paths.store_dir.as_bytes();
     let ld = paths.locks_dir.as_bytes();
     let home_b = paths.home_dir.as_bytes();
@@ -566,7 +564,7 @@ fn publish_locked_part(
 
     var key = string::new(allocator);
     defer key.deinit(allocator);
-    store::format_store_key(allocator, tname, tver, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    store::format_tool_store_key(allocator, tool, url_b, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
     let kb = key.as_bytes();
 
     var entry_dir = path::join(allocator, sd, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
@@ -618,7 +616,6 @@ fn publish_locked_asset_part(
     diag: &var string::String,
 ) -> Error!void {
     let aname = asset.name.as_bytes();
-    let aver = asset.version.as_bytes();
     let sd = paths.store_dir.as_bytes();
     let ld = paths.locks_dir.as_bytes();
 
@@ -639,7 +636,7 @@ fn publish_locked_asset_part(
 
     var key = string::new(allocator);
     defer key.deinit(allocator);
-    store::format_asset_store_key(allocator, aname, aver, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
+    store::format_asset_store_key(allocator, asset, url_b, sha_b, &var key) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
     let kb = key.as_bytes();
 
     var entry_dir = path::join(allocator, sd, kb) catch return unlink_err(allocator, part_b, Error::OutOfMemory);
@@ -760,7 +757,6 @@ fn sync_loaded_manifest(
     var ti = 0;
     while m.tools.at(ti) |tool| {
         let tname = tool.name.as_bytes();
-        let tver = tool.version.as_bytes();
         var url = string::new(allocator);
         defer url.deinit(allocator);
         var expected_sha = string::new(allocator);
@@ -842,7 +838,7 @@ fn sync_loaded_manifest(
         } else {
             var key = string::new(allocator);
             defer key.deinit(allocator);
-            store::format_store_key(allocator, tname, tver, sha_b, &var key) catch return Error::OutOfMemory;
+            store::format_tool_store_key(allocator, tool, url_b, sha_b, &var key) catch return Error::OutOfMemory;
             let kb = key.as_bytes();
 
             var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
@@ -914,8 +910,7 @@ fn sync_loaded_manifest(
                 posix::release_lock(&var guard);
             }
 
-            let key_copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
-            store_keys.append(allocator, move key_copy) catch return Error::OutOfMemory;
+            try append_unique_store_key(allocator, &var store_keys, kb);
 
             if is_global {
                 try update_global_bin_links(allocator, paths, tool, kb, ti + 1);
@@ -927,7 +922,6 @@ fn sync_loaded_manifest(
     var ai = 0;
     while m.assets.at(ai) |asset| {
         let aname = asset.name.as_bytes();
-        let aver = asset.version.as_bytes();
         var url = string::new(allocator);
         defer url.deinit(allocator);
         var expected_sha = string::new(allocator);
@@ -938,7 +932,7 @@ fn sync_loaded_manifest(
 
         var key = string::new(allocator);
         defer key.deinit(allocator);
-        store::format_asset_store_key(allocator, aname, aver, sha_b, &var key) catch return Error::OutOfMemory;
+        store::format_asset_store_key(allocator, asset, url_b, sha_b, &var key) catch return Error::OutOfMemory;
         let kb = key.as_bytes();
 
         var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
@@ -1010,9 +1004,40 @@ fn sync_loaded_manifest(
             posix::release_lock(&var guard);
         }
 
-        let key_copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
-        store_keys.append(allocator, move key_copy) catch return Error::OutOfMemory;
+        try append_unique_store_key(allocator, &var store_keys, kb);
         ai = ai + 1;
+    }
+
+    if m.wrappers.len() > 0 {
+        var tool_paths = map::new<[]u8, string::String>(allocator);
+        defer tool_paths.deinit(allocator);
+        var asset_paths = map::new<[]u8, string::String>(allocator);
+        defer asset_paths.deinit(allocator);
+        if resolve::collect_known_paths(allocator, paths, m, lf, manifest_dir, os, arch_b, &var tool_paths, &var asset_paths) {} else |err| {
+            return map_resolve_err(err);
+        }
+        var wi = 0;
+        while m.wrappers.at(wi) |wrapper| {
+            let wname = wrapper.name.as_bytes();
+            var script = string::new(allocator);
+            defer script.deinit(allocator);
+            if resolve::render_wrapper_script(allocator, wrapper, home_b, manifest_dir, &tool_paths, &asset_paths, m, &var script, diag) {} else |err| {
+                return map_resolve_err(err);
+            }
+            let sb = script.as_bytes();
+            var wkey = string::new(allocator);
+            defer wkey.deinit(allocator);
+            if store::publish_wrapper_script(handle, allocator, paths, wname, sb, ti + ai + wi + 1, &var wkey) {} else |_| {
+                set_msg(allocator, diag, "failed to publish wrapper into store");
+                return Error::StoreFailed;
+            }
+            let wkb = wkey.as_bytes();
+            try append_unique_store_key(allocator, &var store_keys, wkb);
+            if is_global {
+                try update_global_wrapper_bin_link(allocator, paths, wname, wkb, wi + 1);
+            }
+            wi = wi + 1;
+        }
     }
 
     try apply_links(handle, allocator, paths, m, manifest_dir, force, diag);

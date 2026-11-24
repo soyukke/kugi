@@ -16,7 +16,7 @@ Heavy git-worktree and parallel AI-agent workflows quickly burn through local SS
 `kugi` takes a narrow, explicit design:
 
 1. **Zero registry, zero magic**: Every tool URL and SHA-256 hash lives in `kugi.toml` + `kugi.lock`.
-2. **One copy across all worktrees + strip extraction**: Binaries live once in a content-addressed store (`~/.local/share/kugi/store/<name>-<version>-<sha256[:12]>/`). Only declared binaries are extracted; archives and unneeded files are discarded immediately.
+2. **One copy across all worktrees + strip extraction**: Artifacts live once in a content-addressed store (`~/.local/share/kugi/store/`), deduplicated by artifact hash and extraction spec across projects and worktrees. Only declared binaries are extracted by default; archives and unneeded files are discarded immediately.
 3. **Concurrent-safe**: `flock` + atomic `rename` let parallel worktree agents run `kugi sync` simultaneously without races or duplicate downloads.
 4. **Dead-worktree-aware GC & storage budget**: `kugi gc` automatically drops roots pointing to deleted worktrees and enforces an optional `max_size` LRU budget.
 5. **First-class self-updating tools (`mode = "bootstrap"`)**: Reproducibly install fast-moving CLIs on fresh machines without rolling back or blocking their built-in updaters.
@@ -71,12 +71,24 @@ version = "1.0.0"
 url = "https://example.com/packs/dict-{version}.dat"
 archive = "none"
 
+[assets.npm_cli]
+version = "1.0.0"
+url = "https://registry.npmjs.org/example-cli/-/example-cli-{version}.tgz"
+
+[wrappers.example-cli]
+exec = "node"
+args = ["{asset.npm_cli}/dist/cli.js"]
+env = { NODE_ENV = "production" }
+
 [env]
 EDITOR = "nvim"
 FONT_DIR = "{asset.fonts}"
 DICT_FILE = "{asset.dictionary}/dict-1.0.0.dat"
 ZIG_LIB_DIR = "{tool.zig}/lib"
 PROJECT_DATA = "{manifest_dir}/data"
+
+[env_prepend]
+PKG_CONFIG_PATH = ["{asset.fonts}/lib/pkgconfig"]
 
 [links]
 "~/.config/nvim" = "~/my-configs/nvim"
@@ -138,7 +150,7 @@ sh scripts/test-integration.sh  # end-to-end CLI integration tests over loopback
 ./dist/kugi --help
 ```
 
-See [SPEC.md](SPEC.md) for the full v0.1 specification and [AGENTS.md](AGENTS.md) for contributor guidelines.
+See [AGENTS.md](AGENTS.md) for contributor guidelines.
 
 ## License
 

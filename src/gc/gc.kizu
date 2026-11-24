@@ -2,6 +2,7 @@ import kugi::bytes;
 import kugi::lockfile;
 import kugi::manifest;
 import kugi::posix;
+import kugi::resolve;
 import kugi::roots;
 import kugi::store;
 import std::array;
@@ -64,11 +65,53 @@ fn mark_live(
     return;
 }
 
+fn mark_live_wrappers(
+    allocator: Allocator,
+    paths: &store::Paths,
+    m: &manifest::Manifest,
+    lf: &lockfile::Lockfile,
+    manifest_dir: []u8,
+    host_os: []u8,
+    host_arch: []u8,
+    live_keys: &var map::Map<[]u8, bool>,
+) -> Error!bool {
+    if m.wrappers.len() == 0 {
+        return true;
+    }
+    var tool_paths = map::new<[]u8, string::String>(allocator);
+    defer tool_paths.deinit(allocator);
+    var asset_paths = map::new<[]u8, string::String>(allocator);
+    defer asset_paths.deinit(allocator);
+    resolve::collect_known_paths(allocator, paths, m, lf, manifest_dir, host_os, host_arch, &var tool_paths, &var asset_paths) catch return false;
+
+    let home_b = paths.home_dir.as_bytes();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    var wi = 0;
+    while m.wrappers.at(wi) |wrapper| {
+        let wname = wrapper.name.as_bytes();
+        var script = string::new(allocator);
+        defer script.deinit(allocator);
+        resolve::render_wrapper_script(allocator, wrapper, home_b, manifest_dir, &tool_paths, &asset_paths, m, &var script, &var diag) catch return false;
+        let sb = script.as_bytes();
+        var wkey = string::new(allocator);
+        defer wkey.deinit(allocator);
+        store::format_wrapper_store_key(allocator, wname, sb, &var wkey) catch return Error::OutOfMemory;
+        let wkb = wkey.as_bytes();
+        try mark_live(allocator, live_keys, wkb);
+        wi = wi + 1;
+    }
+    return true;
+}
+
 fn collect_keys_from_live_manifest(
     handle: Io,
     allocator: Allocator,
+    paths: &store::Paths,
     manifest_path: []u8,
     lock_path: []u8,
+    host_os: []u8,
+    host_arch: []u8,
     live_keys: &var map::Map<[]u8, bool>,
 ) -> Error!bool {
     var mraw = fs::read_file(handle, allocator, manifest_path, mem::Limit::Bytes(4194304)) catch return false;
@@ -78,6 +121,7 @@ fn collect_keys_from_live_manifest(
     defer diag.deinit(allocator);
     var m = manifest::parse(allocator, mb, &var diag) catch return false;
     defer m.deinit(allocator);
+    let manifest_dir = path::dirname(manifest_path);
 
     var has_lock = false;
     var lf = lockfile::new_lockfile(allocator);
@@ -97,9 +141,13 @@ fn collect_keys_from_live_manifest(
                         let tver = tool.version.as_bytes();
                         if tool.has_sha256 {
                             let sb = tool.sha256.as_bytes();
+                            var url = string::new(allocator);
+                            defer url.deinit(allocator);
+                            manifest::resolve_tool_url(allocator, tool, host_os, host_arch, &var url) catch return Error::OutOfMemory;
+                            let ub = url.as_bytes();
                             var key = string::new(allocator);
                             defer key.deinit(allocator);
-                            store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                            store::format_tool_store_key(allocator, tool, ub, sb, &var key) catch return Error::OutOfMemory;
                             let kb = key.as_bytes();
                             try mark_live(allocator, live_keys, kb);
                         } else if decoded.tools.at(tname) |tlock| {
@@ -108,10 +156,11 @@ fn collect_keys_from_live_manifest(
                                 var j = 0;
                                 while tlock.targets.key_at(j) |tk| {
                                     if tlock.targets.at(tk) |entry| {
+                                        let ub = entry.url.as_bytes();
                                         let sb = entry.sha256.as_bytes();
                                         var key = string::new(allocator);
                                         defer key.deinit(allocator);
-                                        store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                                        store::format_tool_store_key(allocator, tool, ub, sb, &var key) catch return Error::OutOfMemory;
                                         let kb = key.as_bytes();
                                         try mark_live(allocator, live_keys, kb);
                                     }
@@ -128,9 +177,13 @@ fn collect_keys_from_live_manifest(
                     let aver = asset.version.as_bytes();
                     if asset.has_sha256 {
                         let sb = asset.sha256.as_bytes();
+                        var url = string::new(allocator);
+                        defer url.deinit(allocator);
+                        manifest::resolve_asset_url(allocator, asset, host_os, host_arch, &var url) catch return Error::OutOfMemory;
+                        let ub = url.as_bytes();
                         var key = string::new(allocator);
                         defer key.deinit(allocator);
-                        store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                        store::format_asset_store_key(allocator, asset, ub, sb, &var key) catch return Error::OutOfMemory;
                         let kb = key.as_bytes();
                         try mark_live(allocator, live_keys, kb);
                     } else if decoded.assets.at(aname) |alock| {
@@ -139,10 +192,11 @@ fn collect_keys_from_live_manifest(
                             var j = 0;
                             while alock.targets.key_at(j) |tk| {
                                 if alock.targets.at(tk) |entry| {
+                                    let ub = entry.url.as_bytes();
                                     let sb = entry.sha256.as_bytes();
                                     var key = string::new(allocator);
                                     defer key.deinit(allocator);
-                                    store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                                    store::format_asset_store_key(allocator, asset, ub, sb, &var key) catch return Error::OutOfMemory;
                                     let kb = key.as_bytes();
                                     try mark_live(allocator, live_keys, kb);
                                 }
@@ -152,7 +206,7 @@ fn collect_keys_from_live_manifest(
                     }
                     ai = ai + 1;
                 }
-                return true;
+                return try mark_live_wrappers(allocator, paths, &m, &decoded, manifest_dir, host_os, host_arch, live_keys);
             } else |_| {
                 return false;
             }
@@ -167,12 +221,14 @@ fn collect_keys_from_live_manifest(
         while m.tools.at(ti) |tool| {
             if tool.mode == manifest::InstallMode::Store {
                 if tool.has_sha256 {
-                    let tname = tool.name.as_bytes();
-                    let tver = tool.version.as_bytes();
                     let sb = tool.sha256.as_bytes();
+                    var url = string::new(allocator);
+                    defer url.deinit(allocator);
+                    manifest::resolve_tool_url(allocator, tool, host_os, host_arch, &var url) catch return Error::OutOfMemory;
+                    let ub = url.as_bytes();
                     var key = string::new(allocator);
                     defer key.deinit(allocator);
-                    store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                    store::format_tool_store_key(allocator, tool, ub, sb, &var key) catch return Error::OutOfMemory;
                     let kb = key.as_bytes();
                     try mark_live(allocator, live_keys, kb);
                 } else {
@@ -184,12 +240,14 @@ fn collect_keys_from_live_manifest(
         var ai = 0;
         while m.assets.at(ai) |asset| {
             if asset.has_sha256 {
-                let aname = asset.name.as_bytes();
-                let aver = asset.version.as_bytes();
                 let sb = asset.sha256.as_bytes();
+                var url = string::new(allocator);
+                defer url.deinit(allocator);
+                manifest::resolve_asset_url(allocator, asset, host_os, host_arch, &var url) catch return Error::OutOfMemory;
+                let ub = url.as_bytes();
                 var key = string::new(allocator);
                 defer key.deinit(allocator);
-                store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                store::format_asset_store_key(allocator, asset, ub, sb, &var key) catch return Error::OutOfMemory;
                 let kb = key.as_bytes();
                 try mark_live(allocator, live_keys, kb);
             } else {
@@ -197,7 +255,8 @@ fn collect_keys_from_live_manifest(
             }
             ai = ai + 1;
         }
-        return !any_needs_lock;
+        let wrappers_ok = try mark_live_wrappers(allocator, paths, &m, &lf, manifest_dir, host_os, host_arch, live_keys);
+        return !any_needs_lock and wrappers_ok;
     }
     return true;
 }
@@ -215,6 +274,12 @@ fn scan_roots(
     if rkind != posix::PathKind::Dir {
         return;
     }
+    let host_os = posix::detect_os();
+    var host_arch = string::new(allocator);
+    defer host_arch.deinit(allocator);
+    posix::detect_arch(allocator, &var host_arch) catch return Error::IoFailed;
+    let host_arch_b = host_arch.as_bytes();
+
     var entries = fs::read_dir(handle, allocator, rdir) catch return Error::IoFailed;
     defer entries.deinit(allocator);
     var i = 0;
@@ -239,7 +304,7 @@ fn scan_roots(
                         let _ = posix::unlink_if_exists(allocator, full);
                     }
                 } else {
-                    let parsed_live = try collect_keys_from_live_manifest(handle, allocator, mp, lp, live_keys);
+                    let parsed_live = try collect_keys_from_live_manifest(handle, allocator, paths, mp, lp, host_os, host_arch_b, live_keys);
                     if !parsed_live {
                         var ki = 0;
                         while rec.store_keys.at(ki) |sk| {
@@ -574,35 +639,6 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
         return;
     }
 
-    let sd = paths.store_dir.as_bytes();
-    var live_entry = path::join(allocator, sd, "live-1.0.0-111111111111/bin/live") catch return;
-    defer live_entry.deinit(allocator);
-    let leb = live_entry.as_bytes();
-    let _ = posix::write_file_atomic(handle, allocator, leb, "1234567890", "1");
-
-    var live_asset = path::join(allocator, sd, "asset-pack-1.0.0-444444444444/data.txt") catch return;
-    defer live_asset.deinit(allocator);
-    let lab = live_asset.as_bytes();
-    let _ = posix::write_file_atomic(handle, allocator, lab, "1234567890", "1a");
-
-    var dead_old = path::join(allocator, sd, "old-1.0.0-222222222222/bin/old") catch return;
-    defer dead_old.deinit(allocator);
-    let dob = dead_old.as_bytes();
-    let _ = posix::write_file_atomic(handle, allocator, dob, "1234567890", "2");
-
-    var dead_new = path::join(allocator, sd, "asset-dead-1.0.0-333333333333/data.txt") catch return;
-    defer dead_new.deinit(allocator);
-    let dnb = dead_new.as_bytes();
-    let _ = posix::write_file_atomic(handle, allocator, dnb, "1234567890", "3");
-
-    var old_dir = path::join(allocator, sd, "old-1.0.0-222222222222") catch return;
-    defer old_dir.deinit(allocator);
-    let odb = old_dir.as_bytes();
-    let _ = process::spawn_wait8(4, "touch", "-t", "202001010000", odb, "", "", "", "");
-
-    var wt_live = path::join(allocator, base_bytes, "wt_live/kugi.toml") catch return;
-    defer wt_live.deinit(allocator);
-    let wlb = wt_live.as_bytes();
     let live_doc =
         \\[tools.live]
         \\version = "1.0.0"
@@ -615,8 +651,93 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
         \\url = "https://example.com/pack.dat"
         \\archive = "none"
         \\sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+        \\
+        \\[wrappers.run-live]
+        \\exec = "{tool.live}/bin/live"
+        \\args = ["{asset.pack}/pack.dat"]
     ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    var parsed_live = manifest::parse(allocator, live_doc, &var diag) catch return;
+    defer parsed_live.deinit(allocator);
+
+    var live_tool_key = string::new(allocator);
+    defer live_tool_key.deinit(allocator);
+    if parsed_live.tools.at(0) |lt| {
+        store::format_tool_store_key(allocator, lt, "https://example.com/live", "1111111111111111111111111111111111111111111111111111111111111111", &var live_tool_key) catch return;
+    }
+    let ltkb = live_tool_key.as_bytes();
+
+    var live_asset_key = string::new(allocator);
+    defer live_asset_key.deinit(allocator);
+    if parsed_live.assets.at(0) |la| {
+        store::format_asset_store_key(allocator, la, "https://example.com/pack.dat", "4444444444444444444444444444444444444444444444444444444444444444", &var live_asset_key) catch return;
+    }
+    let lakb = live_asset_key.as_bytes();
+
+    let sd = paths.store_dir.as_bytes();
+    var live_entry_dir = path::join(allocator, sd, ltkb) catch return;
+    defer live_entry_dir.deinit(allocator);
+    let ledb = live_entry_dir.as_bytes();
+    var live_entry = path::join(allocator, ledb, "bin/live") catch return;
+    defer live_entry.deinit(allocator);
+    let leb = live_entry.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, leb, "1234567890", "1");
+
+    var live_asset_dir = path::join(allocator, sd, lakb) catch return;
+    defer live_asset_dir.deinit(allocator);
+    let ladb = live_asset_dir.as_bytes();
+    var live_asset = path::join(allocator, ladb, "pack.dat") catch return;
+    defer live_asset.deinit(allocator);
+    let lab = live_asset.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, lab, "1234567890", "1a");
+
+    var dead_old = path::join(allocator, sd, "tool-bin-2222222222222222-aaaaaaaa/bin/old") catch return;
+    defer dead_old.deinit(allocator);
+    let dob = dead_old.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, dob, "1234567890", "2");
+
+    var dead_new = path::join(allocator, sd, "asset-3333333333333333/data.txt") catch return;
+    defer dead_new.deinit(allocator);
+    let dnb = dead_new.as_bytes();
+    let _ = posix::write_file_atomic(handle, allocator, dnb, "1234567890", "3");
+
+    var old_dir = path::join(allocator, sd, "tool-bin-2222222222222222-aaaaaaaa") catch return;
+    defer old_dir.deinit(allocator);
+    let odb = old_dir.as_bytes();
+    let _ = process::spawn_wait8(4, "touch", "-t", "202001010000", odb, "", "", "", "");
+
+    var wt_live = path::join(allocator, base_bytes, "wt_live/kugi.toml") catch return;
+    defer wt_live.deinit(allocator);
+    let wlb = wt_live.as_bytes();
     let _ = posix::write_file_atomic(handle, allocator, wlb, live_doc, "4");
+
+    var wt_live_real = fs::real_path(handle, allocator, wlb) catch return;
+    defer wt_live_real.deinit(allocator);
+    let wlrb = wt_live_real.as_bytes();
+    let wlr_dir = path::dirname(wlrb);
+    var empty_lf = lockfile::new_lockfile(allocator);
+    defer empty_lf.deinit(allocator);
+    var tool_paths = map::new<[]u8, string::String>(allocator);
+    defer tool_paths.deinit(allocator);
+    var asset_paths = map::new<[]u8, string::String>(allocator);
+    defer asset_paths.deinit(allocator);
+    let host_os = posix::detect_os();
+    var host_arch = string::new(allocator);
+    defer host_arch.deinit(allocator);
+    posix::detect_arch(allocator, &var host_arch) catch return;
+    let host_arch_b = host_arch.as_bytes();
+    resolve::collect_known_paths(allocator, &paths, &parsed_live, &empty_lf, wlr_dir, host_os, host_arch_b, &var tool_paths, &var asset_paths) catch return;
+    var wrap_script = string::new(allocator);
+    defer wrap_script.deinit(allocator);
+    if parsed_live.wrappers.at(0) |lw| {
+        resolve::render_wrapper_script(allocator, lw, base_bytes, wlr_dir, &tool_paths, &asset_paths, &parsed_live, &var wrap_script, &var diag) catch return;
+    }
+    let wsb = wrap_script.as_bytes();
+    var live_wrap_key = string::new(allocator);
+    defer live_wrap_key.deinit(allocator);
+    store::publish_wrapper_script(handle, allocator, &paths, "run-live", wsb, 10, &var live_wrap_key) catch return;
+    let lwkb = live_wrap_key.as_bytes();
 
     var wt_dead = path::join(allocator, base_bytes, "wt_dead/kugi.toml") catch return;
     defer wt_dead.deinit(allocator);
@@ -627,17 +748,22 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
     defer live_keys.deinit(allocator);
     var dead_keys = array::new<string::String>(allocator);
     defer dead_keys.deinit(allocator);
-    if string::from_bytes(allocator, "store/live-1.0.0-111111111111") |k1| {
+    if string::from_bytes(allocator, ltkb) |k1| {
         live_keys.append(allocator, move k1) catch return;
     } else |_| {
         return;
     }
-    if string::from_bytes(allocator, "store/asset-pack-1.0.0-444444444444") |k1a| {
+    if string::from_bytes(allocator, lakb) |k1a| {
         live_keys.append(allocator, move k1a) catch return;
     } else |_| {
         return;
     }
-    if string::from_bytes(allocator, "store/old-1.0.0-222222222222") |k2| {
+    if string::from_bytes(allocator, lwkb) |k1w| {
+        live_keys.append(allocator, move k1w) catch return;
+    } else |_| {
+        return;
+    }
+    if string::from_bytes(allocator, "store/tool-bin-2222222222222222-aaaaaaaa") |k2| {
         dead_keys.append(allocator, move k2) catch return;
     } else |_| {
         return;
@@ -655,7 +781,8 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
         testing::fail("dry-run gc failed");
     }
 
-    if enforce_budget(handle, allocator, &paths, 32) |lru| {
+    let wrap_size = mem::len(wsb);
+    if enforce_budget(handle, allocator, &paths, 32 + wrap_size) |lru| {
         testing::expect_equal<i64>(1, lru.deleted_entries);
         testing::expect_equal<i64>(10, lru.freed_bytes);
     } else |_| {
@@ -666,7 +793,7 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
     } else |_| {
         testing::fail("inspect old_dir failed");
     }
-    var new_dir = path::join(allocator, sd, "asset-dead-1.0.0-333333333333") catch return;
+    var new_dir = path::join(allocator, sd, "asset-3333333333333333") catch return;
     defer new_dir.deinit(allocator);
     let ndb = new_dir.as_bytes();
     if posix::inspect_path(handle, allocator, ndb) |k| {
@@ -677,7 +804,7 @@ test "gc prunes dead worktree roots and enforces LRU budget" {
 
     if run_gc(handle, allocator, &paths, false) |real| {
         testing::expect_equal<i64>(1, real.deleted_entries);
-        testing::expect_equal<i64>(2, real.kept_entries);
+        testing::expect_equal<i64>(3, real.kept_entries);
     } else |_| {
         testing::fail("real gc failed");
     }

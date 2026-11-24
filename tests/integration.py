@@ -211,6 +211,21 @@ def assert_true(cond, msg=""):
         raise AssertionError(msg or "expected condition to be true")
 
 
+def tool_store_key(mode, sha, bin_specs):
+    spec = "\n".join(sorted(bin_specs)).encode("utf-8")
+    spec_hex = hashlib.sha256(spec).hexdigest()[:8]
+    return f"tool-{mode}-{sha[:16]}-{spec_hex}"
+
+
+def asset_store_key(sha, unwrap=True, raw_filename=None):
+    if raw_filename is not None:
+        name_hex = hashlib.sha256(raw_filename.encode("utf-8")).hexdigest()[:8]
+        return f"asset-file-{sha[:16]}-{name_hex}"
+    if unwrap:
+        return f"asset-{sha[:16]}"
+    return f"asset-tree-{sha[:16]}"
+
+
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     kugi_bin = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(repo_root, "dist", "kugi")
@@ -429,11 +444,15 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
 
         # Verify strip extraction removed README.md for alpha, kept lib/greeting.txt for ztool
         store_entries = os.listdir(os.path.join(kugi_home, "store"))
-        alpha_dir = [e for e in store_entries if e.startswith("alpha-1.0.0-")][0]
+        alpha_sha_main = hashlib.sha256(strip_tar).hexdigest()
+        ztool_sha_main = hashlib.sha256(full_tar).hexdigest()
+        alpha_dir = tool_store_key("bin", alpha_sha_main, ["alpha:alpha"])
+        assert_true(alpha_dir in store_entries, f"expected {alpha_dir} in {store_entries}")
         assert_true(os.path.isfile(os.path.join(kugi_home, "store", alpha_dir, "bin", "alpha")))
         assert_true(not os.path.exists(os.path.join(kugi_home, "store", alpha_dir, "alpha-1.0.0")))
 
-        ztool_dir = [e for e in store_entries if e.startswith("ztool-2.0.0-")][0]
+        ztool_dir = tool_store_key("all", ztool_sha_main, ["ztool:ztool"])
+        assert_true(ztool_dir in store_entries, f"expected {ztool_dir} in {store_entries}")
         assert_true(os.path.isfile(os.path.join(kugi_home, "store", ztool_dir, "lib", "greeting.txt")))
         assert_true(not os.path.exists(os.path.join(kugi_home, "store", ztool_dir, "ztool-2.0.0")))
 
@@ -484,7 +503,7 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
             )
         r = run_kugi(kugi_bin, ["sync"], base_env, cwd=nodelike_proj)
         assert_eq(0, r.returncode, f"nodelike sync failed: {r.stderr}")
-        nl_key = f"nodelike-1.0.0-{nodelike_sha[:12]}"
+        nl_key = tool_store_key("all", nodelike_sha, ["runtime:runtime", "cli:cli"])
         nl_store = os.path.join(kugi_home, "store", nl_key)
         assert_true(not os.path.exists(os.path.join(nl_store, "nodelike-1.0.0")), "single top-level dir must be unwrapped")
         assert_true(os.path.isfile(os.path.join(nl_store, "lib", "data.txt")), "unwrapped lib/data.txt missing")
@@ -498,7 +517,7 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
         assert_eq(0, r.returncode, f"exec runtime failed: {r.stderr}")
         assert_eq("runtime-ok", r.stdout.strip())
 
-        sb_key = f"symbin-1.0.0-{symbin_sha[:12]}"
+        sb_key = tool_store_key("bin", symbin_sha, ["symtool:symtool"])
         sb_bin = os.path.join(kugi_home, "store", sb_key, "bin", "symtool")
         assert_true(os.path.isfile(sb_bin) and not os.path.islink(sb_bin), "extract=bin must copy symlink target as regular file")
         assert_true(not os.path.exists(os.path.join(kugi_home, "store", sb_key, "libexec")), "extract=bin must strip sibling dirs")
@@ -603,11 +622,14 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
         r = run_kugi(kugi_bin, ["sync"], base_env, cwd=tamper_dir)
         assert_eq(1, r.returncode, "sha256 mismatch must fail")
         assert_true("sha256 mismatch" in r.stderr, r.stderr)
-        assert_eq([], [e for e in os.listdir(os.path.join(kugi_home, "store")) if e.startswith("tampered-")])
+        assert_eq([], [e for e in os.listdir(os.path.join(kugi_home, "store")) if e.startswith("tool-bin-0000000000000000-")])
         assert_eq([], os.listdir(os.path.join(kugi_home, "tmp")), "part file must be deleted on hash mismatch")
 
         # 7. Path traversal & symlink escape rejection
-        for bad_name, bad_path in [("trav", "/downloads/traversal.tar.gz"), ("sym", "/downloads/symlink_escape.tar.gz")]:
+        for bad_name, bad_path, bad_bytes in [
+            ("trav", "/downloads/traversal.tar.gz", traversal_tar),
+            ("sym", "/downloads/symlink_escape.tar.gz", symlink_escape_tar),
+        ]:
             d = os.path.join(root, f"evil_{bad_name}")
             os.makedirs(d)
             with open(os.path.join(d, "kugi.toml"), "w", encoding="utf-8") as f:
@@ -617,7 +639,8 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
             r = run_kugi(kugi_bin, ["sync"], base_env, cwd=d)
             assert_eq(1, r.returncode, f"sync evil {bad_name} must reject traversal/escape")
             assert_true(not os.path.exists(os.path.join(kugi_home, "tmp", "escaped.txt")))
-            assert_eq([], [e for e in os.listdir(os.path.join(kugi_home, "store")) if e.startswith(f"{bad_name}-")])
+            bad_sha = hashlib.sha256(bad_bytes).hexdigest()
+            assert_eq([], [e for e in os.listdir(os.path.join(kugi_home, "store")) if e.startswith(f"tool-bin-{bad_sha[:16]}-")])
 
         # 8. Multi-worktree shared store + concurrent parallel sync under flock
         reg.reset_counts()
@@ -641,7 +664,8 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
             out, err = p.communicate(timeout=30)
             assert_eq(0, p.returncode, f"concurrent sync failed: {err}")
 
-        shared_entries = [e for e in os.listdir(os.path.join(kugi_home, "store")) if e.startswith("shared-1.0.0-")]
+        shared_key = tool_store_key("bin", shared_sha, ["shared:shared"])
+        shared_entries = [e for e in os.listdir(os.path.join(kugi_home, "store")) if e == shared_key]
         assert_eq(1, len(shared_entries), f"expected single deduplicated store entry, got {shared_entries}")
         assert_eq(1, reg.count("/downloads/shared-1.0.0.tar.gz"), "concurrent flock sync should download artifact only once")
 
@@ -680,7 +704,7 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
             )
         r = run_kugi(kugi_bin, ["sync"], base_env, cwd=eph_wt)
         assert_eq(0, r.returncode, f"ephemeral sync failed: {r.stderr}")
-        eph_key = f"eph-1.0.0-{eph_sha[:12]}"
+        eph_key = tool_store_key("bin", eph_sha, ["eph:eph"])
         assert_true(os.path.isdir(os.path.join(kugi_home, "store", eph_key)))
 
         # Simulate deleting worktrees wt_1, wt_2, wt_3, and wt_ephemeral
@@ -877,10 +901,10 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
         dict_sha = hashlib.sha256(dict_raw).hexdigest()
         alpha_sha = hashlib.sha256(strip_tar).hexdigest()
 
-        fonts_store = os.path.join(asset_kugi_home, "store", f"asset-fonts-1.0.0-{fonts_sha[:12]}")
-        bundle_store = os.path.join(asset_kugi_home, "store", f"asset-bundle-1.0.0-{bundle_sha[:12]}")
-        dict_store = os.path.join(asset_kugi_home, "store", f"asset-dict-1.0.0-{dict_sha[:12]}")
-        alpha_store = os.path.join(asset_kugi_home, "store", f"alpha-1.0.0-{alpha_sha[:12]}")
+        fonts_store = os.path.join(asset_kugi_home, "store", asset_store_key(fonts_sha, unwrap=True))
+        bundle_store = os.path.join(asset_kugi_home, "store", asset_store_key(bundle_sha, unwrap=False))
+        dict_store = os.path.join(asset_kugi_home, "store", asset_store_key(dict_sha, raw_filename="dict-1.0.0.dat"))
+        alpha_store = os.path.join(asset_kugi_home, "store", tool_store_key("bin", alpha_sha, ["alpha:alpha"]))
         assert_true(os.path.isfile(os.path.join(fonts_store, "otf", "regular.otf")), "unwrapped fonts file missing")
         assert_true(not os.path.exists(os.path.join(fonts_store, "fonts-1.0.0")), "fonts top dir must be unwrapped")
         assert_true(os.path.isfile(os.path.join(bundle_store, "bundle-1.0.0", "meta.txt")), "unwrap=false must preserve top dir")
@@ -1069,14 +1093,18 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
         host_pack_sha = hashlib.sha256(multi_payloads[("pack", host_target)]).hexdigest()
         other_tool_sha = hashlib.sha256(multi_payloads[("tool", other_target)]).hexdigest()
         other_pack_sha = hashlib.sha256(multi_payloads[("pack", other_target)]).hexdigest()
+        host_tool_key = tool_store_key("bin", host_tool_sha, ["mtool:mtool"])
+        host_pack_key = asset_store_key(host_pack_sha, unwrap=True)
+        other_tool_key = tool_store_key("bin", other_tool_sha, ["mtool:mtool"])
+        other_pack_key = asset_store_key(other_pack_sha, unwrap=True)
         mt_store_entries = sorted(os.listdir(os.path.join(mt_kugi_home, "store")))
         assert_eq(
-            sorted([f"mtool-1.0.0-{host_tool_sha[:12]}", f"asset-mpack-1.0.0-{host_pack_sha[:12]}"]),
+            sorted([host_tool_key, host_pack_key]),
             mt_store_entries,
             "only host target entries may be staged locally",
         )
-        assert_true(f"mtool-1.0.0-{other_tool_sha[:12]}" not in mt_store_entries)
-        assert_true(f"asset-mpack-1.0.0-{other_pack_sha[:12]}" not in mt_store_entries)
+        assert_true(other_tool_key not in mt_store_entries)
+        assert_true(other_pack_key not in mt_store_entries)
 
         r = run_kugi(
             kugi_bin,
@@ -1303,7 +1331,7 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
             r = run_kugi(kugi_bin, ["sync"], tls_env, cwd=t12_tamper)
             assert_eq(1, r.returncode, "TLS 1.2 fallback sha256 mismatch must fail")
             assert_true("sha256 mismatch" in r.stderr, r.stderr)
-            assert_eq([], [e for e in os.listdir(os.path.join(diag_kugi_home, "store")) if e.startswith("t12bad-")])
+            assert_eq([], [e for e in os.listdir(os.path.join(diag_kugi_home, "store")) if e.startswith("tool-bin-0000000000000000-")])
             assert_eq([], os.listdir(os.path.join(diag_kugi_home, "tmp")), "tmp clean after TLS 1.2 hash mismatch")
 
             # TLS 1.2 fallback rejects untrusted certificates
@@ -1322,6 +1350,248 @@ LIB_PATHS = "{{manifest_dir}}/lib:{{manifest_dir}}/ext"
         finally:
             tls13_srv.shutdown()
             tls12_srv.shutdown()
+
+        # 16. Standalone .tgz + [wrappers.<name>] + [env_prepend] + cross-project deduplication & GC
+        npm_tgz = make_tar_gz([
+            {
+                "name": "package/dist/cli.sh",
+                "data": b'printf "%s|%s|%s|%s|%s|%s" "npm-tgz-ok" "$NODE_ENV" "$NODE_PATH" "${WRAPPED_SELF:-no}" "$1" "$2"\n',
+                "mode": 0o644,
+            },
+            {
+                "name": "package/lib/pkgconfig/demo.pc",
+                "data": b"Name: demo\n",
+                "mode": 0o644,
+            },
+        ])
+        sdk_a_tgz = make_tar_gz([
+            {"name": "sdk-a-1.0.0/lib/pkgconfig/a.pc", "data": b"Name: a\n", "mode": 0o644},
+            {"name": "sdk-a-1.0.0/include/a.h", "data": b"int a(void);\n", "mode": 0o644},
+        ])
+        sdk_b_tgz = make_tar_gz([
+            {"name": "sdk-b-1.0.0/lib/pkgconfig/b.pc", "data": b"Name: b\n", "mode": 0o644},
+        ])
+        jsrt_tar = make_tar_gz([
+            {
+                "name": "jsrt-1.0.0/bin/jsrt",
+                "data": b'#!/bin/sh\nexec /bin/sh "$@"\n',
+            },
+        ])
+        reg.put("/downloads/npm-cli-1.0.0.tgz", npm_tgz)
+        reg.put("/downloads/sdk-a-1.0.0.tgz", sdk_a_tgz)
+        reg.put("/downloads/sdk-b-1.0.0.tgz", sdk_b_tgz)
+        reg.put("/downloads/jsrt-1.0.0.tar.gz", jsrt_tar)
+
+        wrap_root = os.path.join(root, "wrap_env")
+        wrap_home = os.path.join(wrap_root, "home")
+        wrap_kugi_home = os.path.join(wrap_root, "kugi_home")
+        wrap_xdg = os.path.join(wrap_root, "xdg_config")
+        wrap_proj = os.path.join(wrap_root, "proj")
+        os.makedirs(wrap_home)
+        os.makedirs(wrap_xdg)
+        os.makedirs(wrap_proj)
+        wrap_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": wrap_home,
+            "KUGI_HOME": wrap_kugi_home,
+            "XDG_CONFIG_HOME": wrap_xdg,
+            "TMPDIR": base_env["TMPDIR"],
+        }
+
+        with open(os.path.join(wrap_proj, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                f'[tools.jsrt]\nversion = "1.0.0"\nurl = "{base_url}/downloads/jsrt-{{version}}.tar.gz"\n'
+                f'bin = ["jsrt"]\n\n'
+                f'[assets.npm_cli]\nversion = "1.0.0"\nurl = "{base_url}/downloads/npm-cli-{{version}}.tgz"\n\n'
+                f'[assets.sdk_a]\nversion = "1.0.0"\nurl = "{base_url}/downloads/sdk-a-{{version}}.tgz"\n\n'
+                f'[assets.sdk_b]\nversion = "1.0.0"\nurl = "{base_url}/downloads/sdk-b-{{version}}.tgz"\n\n'
+                f'[wrappers.npm-cli]\n'
+                f'exec = "{{tool.jsrt}}/bin/jsrt"\n'
+                f'args = ["{{asset.npm_cli}}/dist/cli.sh"]\n'
+                f'env = {{ NODE_ENV = "production" }}\n'
+                f'env_prepend = {{ NODE_PATH = "{{asset.npm_cli}}/node_modules" }}\n\n'
+                f'[wrappers.jsrt]\n'
+                f'exec = "{{tool.jsrt}}/bin/jsrt"\n'
+                f'env = {{ WRAPPED_SELF = "yes" }}\n\n'
+                f'[env_prepend]\n'
+                f'PKG_CONFIG_PATH = ["{{asset.sdk_a}}/lib/pkgconfig", "{{asset.sdk_b}}/lib/pkgconfig"]\n'
+                f'CPATH = "{{asset.sdk_a}}/include"\n'
+            )
+
+        reg.reset_counts()
+        r = run_kugi(kugi_bin, ["lock", "--sync"], wrap_env, cwd=wrap_proj)
+        assert_eq(0, r.returncode, f"wrapper lock --sync failed: {r.stderr}")
+        assert_eq(1, reg.count("/downloads/npm-cli-1.0.0.tgz"), "npm-cli .tgz downloaded once")
+        assert_eq([], os.listdir(os.path.join(wrap_kugi_home, "tmp")), "tmp clean after wrapper sync")
+
+        npm_sha = hashlib.sha256(npm_tgz).hexdigest()
+        sdk_a_sha = hashlib.sha256(sdk_a_tgz).hexdigest()
+        sdk_b_sha = hashlib.sha256(sdk_b_tgz).hexdigest()
+        npm_store = os.path.join(wrap_kugi_home, "store", asset_store_key(npm_sha, unwrap=True))
+        sdk_a_store = os.path.join(wrap_kugi_home, "store", asset_store_key(sdk_a_sha, unwrap=True))
+        sdk_b_store = os.path.join(wrap_kugi_home, "store", asset_store_key(sdk_b_sha, unwrap=True))
+
+        r = run_kugi(kugi_bin, ["status"], wrap_env, cwd=wrap_proj)
+        assert_eq(0, r.returncode, f"wrapper status failed: {r.stderr}")
+        assert_true("wrapper:npm-cli ok " in r.stdout, r.stdout)
+        assert_true("wrapper:jsrt ok " in r.stdout, r.stdout)
+
+        exec_env = dict(wrap_env)
+        exec_env["NODE_PATH"] = "/existing/node"
+        exec_env["PKG_CONFIG_PATH"] = "/existing/pc"
+        r = run_kugi(kugi_bin, ["exec", "--", "npm-cli", "hello", "world"], exec_env, cwd=wrap_proj)
+        assert_eq(0, r.returncode, f"exec npm-cli wrapper failed: {r.stderr}")
+        assert_eq(
+            f"npm-tgz-ok|production|{npm_store}/node_modules:/existing/node|no|hello|world",
+            r.stdout,
+            "npm-cli wrapper output mismatch",
+        )
+
+        # Wrapper with same name as tool overrides tool cleanly without recursion
+        r = run_kugi(
+            kugi_bin,
+            ["exec", "--", "jsrt", "-c", 'printf "%s" "$WRAPPED_SELF"'],
+            exec_env,
+            cwd=wrap_proj,
+        )
+        assert_eq(0, r.returncode, f"same-name wrapper exec failed: {r.stderr}")
+        assert_eq("yes", r.stdout, "same-name wrapper should take precedence over tool")
+
+        # [env_prepend] preserves existing values and avoids trailing ':' when unset
+        r = run_kugi(
+            kugi_bin,
+            ["exec", "--", "sh", "-c", 'printf "%s|%s" "$PKG_CONFIG_PATH" "$CPATH"'],
+            exec_env,
+            cwd=wrap_proj,
+        )
+        assert_eq(0, r.returncode, f"env_prepend exec failed: {r.stderr}")
+        assert_eq(
+            f"{sdk_a_store}/lib/pkgconfig:{sdk_b_store}/lib/pkgconfig:/existing/pc|{sdk_a_store}/include",
+            r.stdout,
+            "env_prepend exec mismatch",
+        )
+
+        # kugi env --shell sh & fish work with wrappers and [env_prepend]
+        r = run_kugi(kugi_bin, ["env", "--shell", "sh"], exec_env, cwd=wrap_proj)
+        assert_eq(0, r.returncode, f"wrapper env sh failed: {r.stderr}")
+        eval_res = subprocess.run(
+            [
+                "sh",
+                "-c",
+                r.stdout + '\nprintf "%s||%s||%s" "$(npm-cli a b)" "$PKG_CONFIG_PATH" "$CPATH"',
+            ],
+            env=exec_env,
+            capture_output=True,
+            text=True,
+        )
+        assert_eq(0, eval_res.returncode, eval_res.stderr)
+        assert_eq(
+            f"npm-tgz-ok|production|{npm_store}/node_modules:/existing/node|no|a|b||{sdk_a_store}/lib/pkgconfig:{sdk_b_store}/lib/pkgconfig:/existing/pc||{sdk_a_store}/include",
+            eval_res.stdout,
+        )
+
+        r = run_kugi(kugi_bin, ["env", "--shell", "fish"], exec_env, cwd=wrap_proj)
+        assert_eq(0, r.returncode, f"wrapper env fish failed: {r.stderr}")
+        assert_true(f"if set -q PKG_CONFIG_PATH; and test -n \"$PKG_CONFIG_PATH\"; set -gx PKG_CONFIG_PATH '{sdk_a_store}/lib/pkgconfig:{sdk_b_store}/lib/pkgconfig:'\"$PKG_CONFIG_PATH\"" in r.stdout, r.stdout)
+
+        # Global manifest creates executable KUGI_HOME/bin/<wrapper> symlink
+        wrap_global_dir = os.path.join(wrap_xdg, "kugi")
+        os.makedirs(wrap_global_dir)
+        jsrt_sha = hashlib.sha256(jsrt_tar).hexdigest()
+        with open(os.path.join(wrap_global_dir, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                f'[tools.jsrt]\nversion = "1.0.0"\nurl = "{base_url}/downloads/jsrt-{{version}}.tar.gz"\n'
+                f'bin = ["jsrt"]\nsha256 = "{jsrt_sha}"\n\n'
+                f'[assets.npm_cli]\nversion = "1.0.0"\nurl = "{base_url}/downloads/npm-cli-{{version}}.tgz"\n'
+                f'sha256 = "{npm_sha}"\n\n'
+                f'[wrappers.glob-cli]\n'
+                f'exec = "{{tool.jsrt}}/bin/jsrt"\n'
+                f'args = ["{{asset.npm_cli}}/dist/cli.sh"]\n'
+                f'env = {{ NODE_ENV = "global" }}\n'
+            )
+        wrap_empty = os.path.join(wrap_root, "empty")
+        os.makedirs(wrap_empty)
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=wrap_empty)
+        assert_eq(0, r.returncode, f"global wrapper sync failed: {r.stderr}")
+        glob_wrap_link = os.path.join(wrap_kugi_home, "bin", "glob-cli")
+        assert_true(os.path.islink(glob_wrap_link), "global wrapper symlink missing")
+        direct_run = subprocess.run([glob_wrap_link, "x", "y"], env=wrap_env, capture_output=True, text=True)
+        assert_eq(0, direct_run.returncode, direct_run.stderr)
+        assert_eq("npm-tgz-ok|global||no|x|y", direct_run.stdout)
+
+        # Cross-project deduplication across different tool/asset aliases + extract=bin vs extract=all isolation
+        dedup_p1 = os.path.join(wrap_root, "dedup_p1")
+        dedup_p2 = os.path.join(wrap_root, "dedup_p2")
+        dedup_p3 = os.path.join(wrap_root, "dedup_p3")
+        os.makedirs(dedup_p1)
+        os.makedirs(dedup_p2)
+        os.makedirs(dedup_p3)
+        full_sha = hashlib.sha256(full_tar).hexdigest()
+        with open(os.path.join(dedup_p1, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                f'[tools.alias_one]\nversion = "2.0.0"\nurl = "{base_url}/downloads/ztool-{{version}}.tar.gz"\n'
+                f'extract = "bin"\nbin = ["ztool"]\nsha256 = "{full_sha}"\n\n'
+                f'[assets.pack_one]\nversion = "1.0.0"\nurl = "{base_url}/downloads/npm-cli-{{version}}.tgz"\n'
+                f'sha256 = "{npm_sha}"\n'
+            )
+        with open(os.path.join(dedup_p2, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                f'[tools.alias_two]\nversion = "2.0.0"\nurl = "{base_url}/downloads/ztool-{{version}}.tar.gz"\n'
+                f'extract = "bin"\nbin = ["ztool"]\nsha256 = "{full_sha}"\n\n'
+                f'[assets.pack_two]\nversion = "1.0.0"\nurl = "{base_url}/downloads/npm-cli-{{version}}.tgz"\n'
+                f'sha256 = "{npm_sha}"\n'
+            )
+        with open(os.path.join(dedup_p3, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                f'[tools.alias_one]\nversion = "2.0.0"\nurl = "{base_url}/downloads/ztool-{{version}}.tar.gz"\n'
+                f'extract = "all"\nbin = ["ztool"]\nsha256 = "{full_sha}"\n'
+            )
+
+        reg.reset_counts()
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=dedup_p1)
+        assert_eq(0, r.returncode, f"dedup_p1 sync failed: {r.stderr}")
+        assert_eq(1, reg.count("/downloads/ztool-2.0.0.tar.gz"), "p1 downloads ztool once")
+        assert_eq(0, reg.count("/downloads/npm-cli-1.0.0.tgz"), "p1 reuses npm-cli from earlier project")
+
+        reg.reset_counts()
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=dedup_p2)
+        assert_eq(0, r.returncode, f"dedup_p2 sync failed: {r.stderr}")
+        assert_eq(0, reg.count("/downloads/ztool-2.0.0.tar.gz"), "p2 with different alias reuses same store entry")
+        assert_eq(0, reg.count("/downloads/npm-cli-1.0.0.tgz"), "p2 with different asset alias reuses same store entry")
+
+        reg.reset_counts()
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=dedup_p3)
+        assert_eq(0, r.returncode, f"dedup_p3 sync failed: {r.stderr}")
+        assert_eq(1, reg.count("/downloads/ztool-2.0.0.tar.gz"), "p3 extract=all uses distinct store entry from extract=bin")
+        r = run_kugi(kugi_bin, ["exec", "--", "ztool"], wrap_env, cwd=dedup_p3)
+        assert_eq(0, r.returncode, f"p3 exec ztool failed: {r.stderr}")
+        assert_eq("hello-from-lib", r.stdout.strip(), "extract=all entry must retain lib/greeting.txt")
+
+        # Validation failures: unknown ref in wrapper and [env]/[env_prepend] overlap
+        bad_wrap_dir = os.path.join(wrap_root, "bad_wrap")
+        os.makedirs(bad_wrap_dir)
+        with open(os.path.join(bad_wrap_dir, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write('[wrappers.broken]\nexec = "{tool.nope}/bin/nope"\n')
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=bad_wrap_dir)
+        assert_eq(2, r.returncode, "wrapper referencing unknown tool must exit 2")
+
+        with open(os.path.join(bad_wrap_dir, "kugi.toml"), "w", encoding="utf-8") as f:
+            f.write('[env]\nFOO = "1"\n\n[env_prepend]\nFOO = "2"\n')
+        r = run_kugi(kugi_bin, ["sync"], wrap_env, cwd=bad_wrap_dir)
+        assert_eq(2, r.returncode, "overlapping [env] and [env_prepend] must exit 2")
+
+        # Dead-worktree GC reclaims project wrappers and unique assets while keeping global wrapper & shared assets alive
+        shutil.rmtree(wrap_proj)
+        r = run_kugi(kugi_bin, ["gc"], wrap_env, cwd=wrap_root)
+        assert_eq(0, r.returncode, f"wrapper gc failed: {r.stderr}")
+        assert_true("deleted_roots: 1" in r.stdout, r.stdout)
+        assert_true("deleted_store_entries: 4" in r.stdout, r.stdout)
+        assert_true(not os.path.exists(sdk_a_store), "dead sdk_a must be reclaimed")
+        assert_true(not os.path.exists(sdk_b_store), "dead sdk_b must be reclaimed")
+        assert_true(os.path.isdir(npm_store), "shared npm_cli used by global wrapper must survive GC")
+        direct_run2 = subprocess.run([glob_wrap_link, "after", "gc"], env=wrap_env, capture_output=True, text=True)
+        assert_eq(0, direct_run2.returncode, direct_run2.stderr)
+        assert_eq("npm-tgz-ok|global||no|after|gc", direct_run2.stdout)
 
     srv.shutdown()
     elapsed = time.monotonic() - t0

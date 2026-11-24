@@ -3,6 +3,7 @@ import kugi::gc;
 import kugi::lockfile;
 import kugi::manifest;
 import kugi::posix;
+import kugi::resolve;
 import kugi::store;
 import kugi::workspace;
 import std::array;
@@ -25,11 +26,6 @@ pub error Error {
     OutOfMemory,
 }
 
-pub enum ShellKind {
-    Posix,
-    Fish,
-}
-
 fn map_ws_err(err: workspace::Error) -> Error {
     if err == workspace::Error::ManifestNotFound {
         return Error::ManifestNotFound;
@@ -47,6 +43,56 @@ fn map_ws_err(err: workspace::Error) -> Error {
         return Error::OutOfMemory;
     }
     return Error::IoFailed;
+}
+
+fn map_resolve_err(err: resolve::Error) -> Error {
+    if err == resolve::Error::ManifestInvalid {
+        return Error::ManifestInvalid;
+    }
+    if err == resolve::Error::UsageError {
+        return Error::UsageError;
+    }
+    if err == resolve::Error::Unlocked {
+        return Error::Unlocked;
+    }
+    if err == resolve::Error::OutOfMemory {
+        return Error::OutOfMemory;
+    }
+    return Error::IoFailed;
+}
+
+fn expand_value_rt(
+    allocator: Allocator,
+    raw: []u8,
+    home_dir: []u8,
+    manifest_dir: []u8,
+    tool_paths: &map::Map<[]u8, string::String>,
+    asset_paths: &map::Map<[]u8, string::String>,
+    m: &manifest::Manifest,
+    out: &var string::String,
+    diag: &var string::String,
+) -> Error!void {
+    if resolve::expand_placeholders(allocator, raw, home_dir, manifest_dir, tool_paths, asset_paths, m, out, diag) {} else |err| {
+        return map_resolve_err(err);
+    }
+    return;
+}
+
+fn expand_prepend_rt(
+    allocator: Allocator,
+    values: &array::Array<string::String>,
+    home_dir: []u8,
+    manifest_dir: []u8,
+    tool_paths: &map::Map<[]u8, string::String>,
+    asset_paths: &map::Map<[]u8, string::String>,
+    m: &manifest::Manifest,
+    out_joined: &var string::String,
+    diag: &var string::String,
+) -> Error!void {
+    if resolve::expand_env_prepend_values(allocator, values, home_dir, manifest_dir, tool_paths, asset_paths, m, out_joined, diag) {} else |err| {
+        return map_resolve_err(err);
+    }
+    return;
 }
 
 fn contains_dir(dirs: &array::Array<string::String>, target: []u8) -> bool {
@@ -82,8 +128,8 @@ fn collect_tool_entries(
             var install_dir = string::new(allocator);
             defer install_dir.deinit(allocator);
             let raw_dir = tool.install_dir.as_bytes();
-            if workspace::resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var install_dir) {} else |err| {
-                return map_ws_err(err);
+            if resolve::resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var install_dir) {} else |err| {
+                return map_resolve_err(err);
             }
             let idb = install_dir.as_bytes();
             if !contains_dir(out_dirs, idb) {
@@ -98,10 +144,10 @@ fn collect_tool_entries(
             var sha = string::new(allocator);
             defer sha.deinit(allocator);
             var ok = false;
-            if workspace::resolve_tool_lock(allocator, tool, lf, os, arch, &var url, &var sha) |matched| {
+            if resolve::resolve_tool_lock(allocator, tool, lf, os, arch, &var url, &var sha) |matched| {
                 ok = matched;
             } else |err| {
-                return map_ws_err(err);
+                return map_resolve_err(err);
             }
             if !ok {
                 diag.clear();
@@ -110,11 +156,11 @@ fn collect_tool_entries(
                 diag.append_bytes(allocator, "' is not locked for this platform; run `kugi lock` and `kugi sync`") catch return Error::OutOfMemory;
                 return Error::Unlocked;
             }
-            let tver = tool.version.as_bytes();
+            let ub = url.as_bytes();
             let sb = sha.as_bytes();
             var key = string::new(allocator);
             defer key.deinit(allocator);
-            store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+            store::format_tool_store_key(allocator, tool, ub, sb, &var key) catch return Error::OutOfMemory;
             let kb = key.as_bytes();
 
             var store_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
@@ -153,18 +199,18 @@ fn collect_asset_paths(
         var sha = string::new(allocator);
         defer sha.deinit(allocator);
         var ok = false;
-        if workspace::resolve_asset_lock(allocator, asset, lf, os, arch, &var url, &var sha) |matched| {
+        if resolve::resolve_asset_lock(allocator, asset, lf, os, arch, &var url, &var sha) |matched| {
             ok = matched;
         } else |err| {
-            return map_ws_err(err);
+            return map_resolve_err(err);
         }
         if ok {
             let aname = asset.name.as_bytes();
-            let aver = asset.version.as_bytes();
+            let ub = url.as_bytes();
             let sb = sha.as_bytes();
             var key = string::new(allocator);
             defer key.deinit(allocator);
-            store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+            store::format_asset_store_key(allocator, asset, ub, sb, &var key) catch return Error::OutOfMemory;
             let kb = key.as_bytes();
             var store_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
             defer store_dir.deinit(allocator);
@@ -177,35 +223,76 @@ fn collect_asset_paths(
     return;
 }
 
-pub fn append_shell_quoted(
+fn collect_wrapper_bin_dirs(
     allocator: Allocator,
-    shell: ShellKind,
-    value: []u8,
-    out: &var string::String,
-) -> mem::Error!void {
-    try out.append_byte(allocator, cast<u8>(39));
-    let length = mem::len(value);
-    var i = 0;
-    while i < length {
-        let b = value[i];
-        if shell == ShellKind::Fish {
-            if b == cast<u8>(39) or b == cast<u8>(92) {
-                try out.append_byte(allocator, cast<u8>(92));
-            }
-            try out.append_byte(allocator, b);
-        } else {
-            if b == cast<u8>(39) {
-                try out.append_byte(allocator, cast<u8>(39));
-                try out.append_byte(allocator, cast<u8>(92));
-                try out.append_byte(allocator, cast<u8>(39));
-                try out.append_byte(allocator, cast<u8>(39));
-            } else {
-                try out.append_byte(allocator, b);
-            }
+    paths: &store::Paths,
+    m: &manifest::Manifest,
+    home_dir: []u8,
+    manifest_dir: []u8,
+    tool_paths: &map::Map<[]u8, string::String>,
+    asset_paths: &map::Map<[]u8, string::String>,
+    out_dirs: &var array::Array<string::String>,
+    diag: &var string::String,
+) -> Error!void {
+    let sd = paths.store_dir.as_bytes();
+    var wi = 0;
+    while m.wrappers.at(wi) |wrapper| {
+        let wname = wrapper.name.as_bytes();
+        var script = string::new(allocator);
+        defer script.deinit(allocator);
+        if resolve::render_wrapper_script(allocator, wrapper, home_dir, manifest_dir, tool_paths, asset_paths, m, &var script, diag) {} else |err| {
+            return map_resolve_err(err);
         }
-        i = i + 1;
+        let sb = script.as_bytes();
+        var wkey = string::new(allocator);
+        defer wkey.deinit(allocator);
+        store::format_wrapper_store_key(allocator, wname, sb, &var wkey) catch return Error::OutOfMemory;
+        let wkb = wkey.as_bytes();
+        var entry_dir = path::join(allocator, sd, wkb) catch return Error::OutOfMemory;
+        defer entry_dir.deinit(allocator);
+        let edb = entry_dir.as_bytes();
+        var bin_dir = path::join(allocator, edb, "bin") catch return Error::OutOfMemory;
+        defer bin_dir.deinit(allocator);
+        let bdb = bin_dir.as_bytes();
+        if !contains_dir(out_dirs, bdb) {
+            let copy = string::from_bytes(allocator, bdb) catch return Error::OutOfMemory;
+            out_dirs.append(allocator, move copy) catch return Error::OutOfMemory;
+        }
+        wi = wi + 1;
     }
-    try out.append_byte(allocator, cast<u8>(39));
+    return;
+}
+
+fn collect_runtime_bin_dirs(
+    allocator: Allocator,
+    paths: &store::Paths,
+    m: &manifest::Manifest,
+    lf: &lockfile::Lockfile,
+    manifest_dir: []u8,
+    os: []u8,
+    arch: []u8,
+    out_bin_dirs: &var array::Array<string::String>,
+    out_tool_paths: &var map::Map<[]u8, string::String>,
+    out_asset_paths: &var map::Map<[]u8, string::String>,
+    diag: &var string::String,
+) -> Error!void {
+    var tool_dirs = array::new<string::String>(allocator);
+    defer tool_dirs.deinit(allocator);
+    try collect_tool_entries(allocator, paths, m, lf, manifest_dir, os, arch, &var tool_dirs, out_tool_paths, diag);
+    try collect_asset_paths(allocator, paths, m, lf, os, arch, out_asset_paths);
+
+    let home_b = paths.home_dir.as_bytes();
+    try collect_wrapper_bin_dirs(allocator, paths, m, home_b, manifest_dir, out_tool_paths, out_asset_paths, out_bin_dirs, diag);
+
+    var ti = 0;
+    while tool_dirs.at(ti) |dir| {
+        let db = dir.as_bytes();
+        if !contains_dir(out_bin_dirs, db) {
+            let copy = string::from_bytes(allocator, db) catch return Error::OutOfMemory;
+            out_bin_dirs.append(allocator, move copy) catch return Error::OutOfMemory;
+        }
+        ti = ti + 1;
+    }
     return;
 }
 
@@ -213,32 +300,46 @@ pub fn parse_shell_kind(
     allocator: Allocator,
     explicit_shell: []u8,
     diag: &var string::String,
-) -> Error!ShellKind {
+) -> Error!resolve::ShellKind {
     if mem::len(explicit_shell) == 0 {
         if process::env("SHELL") |sh_env| {
             let base = path::basename(sh_env);
             if mem::equal_bytes(base, "fish") {
-                return ShellKind::Fish;
+                return resolve::ShellKind::Fish;
             }
         }
-        return ShellKind::Posix;
+        return resolve::ShellKind::Posix;
     }
     if mem::equal_bytes(explicit_shell, "sh")
         or mem::equal_bytes(explicit_shell, "zsh")
         or mem::equal_bytes(explicit_shell, "bash") {
-        return ShellKind::Posix;
+        return resolve::ShellKind::Posix;
     }
     if mem::equal_bytes(explicit_shell, "fish") {
-        return ShellKind::Fish;
+        return resolve::ShellKind::Fish;
     }
     diag.clear();
     diag.append_bytes(allocator, "unsupported shell (expected sh, zsh, bash, or fish)") catch return Error::OutOfMemory;
     return Error::UsageError;
 }
 
-pub fn expand_env_value(
+fn find_env_prepend_spec(m: &manifest::Manifest, key: []u8) -> ?i64 {
+    var i = 0;
+    while m.env_prepend.at(i) |item| {
+        let kb = item.key.as_bytes();
+        if mem::equal_bytes(kb, key) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn append_fish_env_prepend_line(
     allocator: Allocator,
-    raw: []u8,
+    key: []u8,
+    values: &array::Array<string::String>,
+    joined: []u8,
     home_dir: []u8,
     manifest_dir: []u8,
     tool_paths: &map::Map<[]u8, string::String>,
@@ -247,97 +348,59 @@ pub fn expand_env_value(
     out: &var string::String,
     diag: &var string::String,
 ) -> Error!void {
-    if mem::equal_bytes(raw, "~") {
-        out.append_bytes(allocator, home_dir) catch return Error::OutOfMemory;
+    if mem::equal_bytes(key, "PATH") {
+        out.append_bytes(allocator, "set -gx PATH") catch return Error::OutOfMemory;
+        var vi = 0;
+        while values.at(vi) |item| {
+            let raw = item.as_bytes();
+            var expanded = string::new(allocator);
+            defer expanded.deinit(allocator);
+            if resolve::expand_placeholders(allocator, raw, home_dir, manifest_dir, tool_paths, asset_paths, m, &var expanded, diag) {} else |err| {
+                return map_resolve_err(err);
+            }
+            let eb = expanded.as_bytes();
+            out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+            resolve::append_shell_quoted(allocator, resolve::ShellKind::Fish, eb, out) catch return Error::OutOfMemory;
+            vi = vi + 1;
+        }
+        out.append_bytes(allocator, " $PATH") catch return Error::OutOfMemory;
+        out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
         return;
     }
-    var start: i64 = 0;
-    if mem::starts_with(raw, "~/") {
-        let hlen = mem::len(home_dir);
-        if hlen > 0 and home_dir[hlen - 1] == cast<u8>(47) {
-            out.append_bytes(allocator, home_dir[0..hlen - 1]) catch return Error::OutOfMemory;
-        } else {
-            out.append_bytes(allocator, home_dir) catch return Error::OutOfMemory;
-        }
-        start = 1;
-    }
-    let length = mem::len(raw);
-    var i = start;
-    while i < length {
-        if i + 14 <= length and mem::equal_bytes(raw[i..i + 14], "{manifest_dir}") {
-            out.append_bytes(allocator, manifest_dir) catch return Error::OutOfMemory;
-            i = i + 14;
-        } else if i + 7 <= length and mem::equal_bytes(raw[i..i + 7], "{asset.") {
-            if bytes::index_of_byte(raw, cast<u8>(125), i + 7) |close| {
-                let name = raw[i + 7..close];
-                if mem::len(name) == 0 {
-                    diag.clear();
-                    diag.append_bytes(allocator, "empty asset name in '{asset.}' placeholder in [env]") catch return Error::OutOfMemory;
-                    return Error::ManifestInvalid;
-                }
-                if asset_paths.at(name) |resolved| {
-                    let rb = resolved.as_bytes();
-                    out.append_bytes(allocator, rb) catch return Error::OutOfMemory;
-                    i = close + 1;
-                } else if manifest::find_asset_index(m, name) |_| {
-                    diag.clear();
-                    diag.append_bytes(allocator, "asset '") catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, name) catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, "' referenced in [env] is not locked for this platform; run `kugi lock` and `kugi sync`") catch return Error::OutOfMemory;
-                    return Error::Unlocked;
-                } else {
-                    diag.clear();
-                    diag.append_bytes(allocator, "unknown asset '") catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, name) catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, "' referenced in [env]") catch return Error::OutOfMemory;
-                    return Error::ManifestInvalid;
-                }
-            } else {
-                diag.clear();
-                diag.append_bytes(allocator, "unterminated '{asset.' placeholder in [env]") catch return Error::OutOfMemory;
-                return Error::ManifestInvalid;
-            }
-        } else if i + 6 <= length and mem::equal_bytes(raw[i..i + 6], "{tool.") {
-            if bytes::index_of_byte(raw, cast<u8>(125), i + 6) |close| {
-                let name = raw[i + 6..close];
-                if mem::len(name) == 0 {
-                    diag.clear();
-                    diag.append_bytes(allocator, "empty tool name in '{tool.}' placeholder in [env]") catch return Error::OutOfMemory;
-                    return Error::ManifestInvalid;
-                }
-                if tool_paths.at(name) |resolved| {
-                    let rb = resolved.as_bytes();
-                    out.append_bytes(allocator, rb) catch return Error::OutOfMemory;
-                    i = close + 1;
-                } else if manifest::find_tool_index(m, name) |_| {
-                    diag.clear();
-                    diag.append_bytes(allocator, "tool '") catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, name) catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, "' referenced in [env] is not locked for this platform; run `kugi lock` and `kugi sync`") catch return Error::OutOfMemory;
-                    return Error::Unlocked;
-                } else {
-                    diag.clear();
-                    diag.append_bytes(allocator, "unknown tool '") catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, name) catch return Error::OutOfMemory;
-                    diag.append_bytes(allocator, "' referenced in [env]") catch return Error::OutOfMemory;
-                    return Error::ManifestInvalid;
-                }
-            } else {
-                diag.clear();
-                diag.append_bytes(allocator, "unterminated '{tool.' placeholder in [env]") catch return Error::OutOfMemory;
-                return Error::ManifestInvalid;
-            }
-        } else {
-            out.append_byte(allocator, raw[i]) catch return Error::OutOfMemory;
-            i = i + 1;
-        }
-    }
+
+    var with_colon = string::new(allocator);
+    defer with_colon.deinit(allocator);
+    with_colon.append_bytes(allocator, joined) catch return Error::OutOfMemory;
+    with_colon.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
+    let wcb = with_colon.as_bytes();
+
+    out.append_bytes(allocator, "if set -q ") catch return Error::OutOfMemory;
+    out.append_bytes(allocator, key) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, "; and test -n ") catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(36)) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, key) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, "; set -gx ") catch return Error::OutOfMemory;
+    out.append_bytes(allocator, key) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+    resolve::append_shell_quoted(allocator, resolve::ShellKind::Fish, wcb, out) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(36)) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, key) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, "; else; set -gx ") catch return Error::OutOfMemory;
+    out.append_bytes(allocator, key) catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+    resolve::append_shell_quoted(allocator, resolve::ShellKind::Fish, joined, out) catch return Error::OutOfMemory;
+    out.append_bytes(allocator, "; end") catch return Error::OutOfMemory;
+    out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
     return;
 }
 
 pub fn format_env_script(
     allocator: Allocator,
-    shell: ShellKind,
+    shell: resolve::ShellKind,
     bin_dirs: &array::Array<string::String>,
     m: &manifest::Manifest,
     home_dir: []u8,
@@ -347,42 +410,6 @@ pub fn format_env_script(
     out: &var string::String,
     diag: &var string::String,
 ) -> Error!void {
-    if bin_dirs.len() > 0 {
-        if shell == ShellKind::Fish {
-            out.append_bytes(allocator, "set -gx PATH") catch return Error::OutOfMemory;
-            var bi = 0;
-            while bin_dirs.at(bi) |dir| {
-                out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
-                let db = dir.as_bytes();
-                append_shell_quoted(allocator, ShellKind::Fish, db, out) catch return Error::OutOfMemory;
-                bi = bi + 1;
-            }
-            out.append_bytes(allocator, " $PATH") catch return Error::OutOfMemory;
-            out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
-        } else {
-            var joined = string::new(allocator);
-            defer joined.deinit(allocator);
-            var bi = 0;
-            while bin_dirs.at(bi) |dir| {
-                if bi > 0 {
-                    joined.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
-                }
-                let db = dir.as_bytes();
-                joined.append_bytes(allocator, db) catch return Error::OutOfMemory;
-                bi = bi + 1;
-            }
-            let jb = joined.as_bytes();
-            out.append_bytes(allocator, "export PATH=") catch return Error::OutOfMemory;
-            append_shell_quoted(allocator, ShellKind::Posix, jb, out) catch return Error::OutOfMemory;
-            out.append_bytes(allocator, "${PATH:+:") catch return Error::OutOfMemory;
-            out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
-            out.append_bytes(allocator, "$PATH") catch return Error::OutOfMemory;
-            out.append_byte(allocator, cast<u8>(34)) catch return Error::OutOfMemory;
-            out.append_byte(allocator, cast<u8>(125)) catch return Error::OutOfMemory;
-            out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
-        }
-    }
-
     var env_keys = array::new<string::String>(allocator);
     defer env_keys.deinit(allocator);
     var ki = 0;
@@ -400,23 +427,86 @@ pub fn format_env_script(
             let v_raw = v_str.as_bytes();
             var expanded = string::new(allocator);
             defer expanded.deinit(allocator);
-            try expand_env_value(allocator, v_raw, home_dir, manifest_dir, tool_paths, asset_paths, m, &var expanded, diag);
+            if resolve::expand_placeholders(allocator, v_raw, home_dir, manifest_dir, tool_paths, asset_paths, m, &var expanded, diag) {} else |err| {
+                return map_resolve_err(err);
+            }
             let eb = expanded.as_bytes();
-            if shell == ShellKind::Fish {
+            if shell == resolve::ShellKind::Fish {
                 out.append_bytes(allocator, "set -gx ") catch return Error::OutOfMemory;
                 out.append_bytes(allocator, k) catch return Error::OutOfMemory;
                 out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
-                append_shell_quoted(allocator, ShellKind::Fish, eb, out) catch return Error::OutOfMemory;
+                resolve::append_shell_quoted(allocator, resolve::ShellKind::Fish, eb, out) catch return Error::OutOfMemory;
                 out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
             } else {
                 out.append_bytes(allocator, "export ") catch return Error::OutOfMemory;
                 out.append_bytes(allocator, k) catch return Error::OutOfMemory;
                 out.append_byte(allocator, cast<u8>(61)) catch return Error::OutOfMemory;
-                append_shell_quoted(allocator, ShellKind::Posix, eb, out) catch return Error::OutOfMemory;
+                resolve::append_shell_quoted(allocator, resolve::ShellKind::Posix, eb, out) catch return Error::OutOfMemory;
                 out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
             }
         }
         ei = ei + 1;
+    }
+
+    var prepend_keys = array::new<string::String>(allocator);
+    defer prepend_keys.deinit(allocator);
+    var pki = 0;
+    while m.env_prepend.at(pki) |item| {
+        let kb = item.key.as_bytes();
+        let copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
+        prepend_keys.append(allocator, move copy) catch return Error::OutOfMemory;
+        pki = pki + 1;
+    }
+    sort::strings(&var prepend_keys) catch return Error::IoFailed;
+
+    var pi = 0;
+    while prepend_keys.at(pi) |k_str| {
+        let k = k_str.as_bytes();
+        if find_env_prepend_spec(m, k) |spec_idx| {
+            if m.env_prepend.at(spec_idx) |spec| {
+                var joined = string::new(allocator);
+                defer joined.deinit(allocator);
+                if resolve::expand_env_prepend_values(allocator, &spec.values, home_dir, manifest_dir, tool_paths, asset_paths, m, &var joined, diag) {} else |err| {
+                    return map_resolve_err(err);
+                }
+                let jb = joined.as_bytes();
+                if shell == resolve::ShellKind::Fish {
+                    try append_fish_env_prepend_line(allocator, k, &spec.values, jb, home_dir, manifest_dir, tool_paths, asset_paths, m, out, diag);
+                } else {
+                    resolve::append_posix_env_prepend_line(allocator, k, jb, out) catch return Error::OutOfMemory;
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+
+    if bin_dirs.len() > 0 {
+        if shell == resolve::ShellKind::Fish {
+            out.append_bytes(allocator, "set -gx PATH") catch return Error::OutOfMemory;
+            var bi = 0;
+            while bin_dirs.at(bi) |dir| {
+                out.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+                let db = dir.as_bytes();
+                resolve::append_shell_quoted(allocator, resolve::ShellKind::Fish, db, out) catch return Error::OutOfMemory;
+                bi = bi + 1;
+            }
+            out.append_bytes(allocator, " $PATH") catch return Error::OutOfMemory;
+            out.append_byte(allocator, cast<u8>(10)) catch return Error::OutOfMemory;
+        } else {
+            var joined = string::new(allocator);
+            defer joined.deinit(allocator);
+            var bi = 0;
+            while bin_dirs.at(bi) |dir| {
+                if bi > 0 {
+                    joined.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
+                }
+                let db = dir.as_bytes();
+                joined.append_bytes(allocator, db) catch return Error::OutOfMemory;
+                bi = bi + 1;
+            }
+            let jb = joined.as_bytes();
+            resolve::append_posix_env_prepend_line(allocator, "PATH", jb, out) catch return Error::OutOfMemory;
+        }
     }
     return;
 }
@@ -464,8 +554,7 @@ pub fn run_env(
             defer tool_paths.deinit(allocator);
             var asset_paths = map::new<[]u8, string::String>(allocator);
             defer asset_paths.deinit(allocator);
-            try collect_tool_entries(allocator, paths, &m, &lf, manifest_dir, os, arch_b, &var bin_dirs, &var tool_paths, diag);
-            try collect_asset_paths(allocator, paths, &m, &lf, os, arch_b, &var asset_paths);
+            try collect_runtime_bin_dirs(allocator, paths, &m, &lf, manifest_dir, os, arch_b, &var bin_dirs, &var tool_paths, &var asset_paths, diag);
 
             let home_b = paths.home_dir.as_bytes();
             var script = string::new(allocator);
@@ -531,8 +620,7 @@ pub fn run_exec(
             defer tool_paths.deinit(allocator);
             var asset_paths = map::new<[]u8, string::String>(allocator);
             defer asset_paths.deinit(allocator);
-            try collect_tool_entries(allocator, paths, &m, &lf, manifest_dir, os, arch_b, &var bin_dirs, &var tool_paths, diag);
-            try collect_asset_paths(allocator, paths, &m, &lf, os, arch_b, &var asset_paths);
+            try collect_runtime_bin_dirs(allocator, paths, &m, &lf, manifest_dir, os, arch_b, &var bin_dirs, &var tool_paths, &var asset_paths, diag);
 
             let home_b = paths.home_dir.as_bytes();
             var env_keys = array::new<string::String>(allocator);
@@ -554,10 +642,67 @@ pub fn run_exec(
                 errdefer expanded.deinit(allocator);
                 if m.env.at(k) |v_str| {
                     let v_raw = v_str.as_bytes();
-                    try expand_env_value(allocator, v_raw, home_b, manifest_dir, &tool_paths, &asset_paths, &m, &var expanded, diag);
+                    try expand_value_rt(allocator, v_raw, home_b, manifest_dir, &tool_paths, &asset_paths, &m, &var expanded, diag);
                 }
                 env_vals.append(allocator, move expanded) catch return Error::OutOfMemory;
                 ei = ei + 1;
+            }
+
+            var prepend_keys = array::new<string::String>(allocator);
+            defer prepend_keys.deinit(allocator);
+            var prepend_vals = array::new<string::String>(allocator);
+            defer prepend_vals.deinit(allocator);
+            var pki = 0;
+            while m.env_prepend.at(pki) |item| {
+                let kb = item.key.as_bytes();
+                let copy = string::from_bytes(allocator, kb) catch return Error::OutOfMemory;
+                prepend_keys.append(allocator, move copy) catch return Error::OutOfMemory;
+                pki = pki + 1;
+            }
+            sort::strings(&var prepend_keys) catch return Error::IoFailed;
+
+            var pei = 0;
+            while prepend_keys.at(pei) |k_str| {
+                let k = k_str.as_bytes();
+                var joined = string::new(allocator);
+                errdefer joined.deinit(allocator);
+                if find_env_prepend_spec(&m, k) |spec_idx| {
+                    if m.env_prepend.at(spec_idx) |spec| {
+                        try expand_prepend_rt(allocator, &spec.values, home_b, manifest_dir, &tool_paths, &asset_paths, &m, &var joined, diag);
+                    }
+                }
+                prepend_vals.append(allocator, move joined) catch return Error::OutOfMemory;
+                pei = pei + 1;
+            }
+
+            var si = 0;
+            while env_keys.at(si) |k_str| {
+                if env_vals.at(si) |v_str| {
+                    let kb = k_str.as_bytes();
+                    let vb = v_str.as_bytes();
+                    posix::set_env(allocator, kb, vb) catch return Error::IoFailed;
+                }
+                si = si + 1;
+            }
+
+            var psi = 0;
+            while prepend_keys.at(psi) |k_str| {
+                if prepend_vals.at(psi) |v_str| {
+                    let kb = k_str.as_bytes();
+                    let vb = v_str.as_bytes();
+                    var combined = string::new(allocator);
+                    defer combined.deinit(allocator);
+                    combined.append_bytes(allocator, vb) catch return Error::OutOfMemory;
+                    if process::env(kb) |cur| {
+                        if mem::len(cur) > 0 {
+                            combined.append_byte(allocator, cast<u8>(58)) catch return Error::OutOfMemory;
+                            combined.append_bytes(allocator, cur) catch return Error::OutOfMemory;
+                        }
+                    }
+                    let cb = combined.as_bytes();
+                    posix::set_env(allocator, kb, cb) catch return Error::IoFailed;
+                }
+                psi = psi + 1;
             }
 
             if bin_dirs.len() > 0 {
@@ -580,16 +725,6 @@ pub fn run_exec(
                 }
                 let npb = new_path.as_bytes();
                 posix::set_env(allocator, "PATH", npb) catch return Error::IoFailed;
-            }
-
-            var si = 0;
-            while env_keys.at(si) |k_str| {
-                if env_vals.at(si) |v_str| {
-                    let kb = k_str.as_bytes();
-                    let vb = v_str.as_bytes();
-                    posix::set_env(allocator, kb, vb) catch return Error::IoFailed;
-                }
-                si = si + 1;
             }
 
             posix::exec_replace(allocator, cmd_args) catch return Error::ExecFailed;
@@ -647,10 +782,10 @@ pub fn run_status(
                 var sha = string::new(allocator);
                 defer sha.deinit(allocator);
                 var locked = false;
-                if workspace::resolve_tool_lock(allocator, tool, &lf, os, arch_b, &var url, &var sha) |ok| {
+                if resolve::resolve_tool_lock(allocator, tool, &lf, os, arch_b, &var url, &var sha) |ok| {
                     locked = ok;
                 } else |err| {
-                    return map_ws_err(err);
+                    return map_resolve_err(err);
                 }
 
                 var status_text: []u8 = "unlocked";
@@ -661,8 +796,8 @@ pub fn run_status(
                     resolved.append_bytes(allocator, "-") catch return Error::OutOfMemory;
                 } else if tool.mode == manifest::InstallMode::Bootstrap {
                     let raw_dir = tool.install_dir.as_bytes();
-                    if workspace::resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var resolved) {} else |err| {
-                        return map_ws_err(err);
+                    if resolve::resolve_user_path(allocator, raw_dir, home_b, manifest_dir, &var resolved) {} else |err| {
+                        return map_resolve_err(err);
                     }
                     let rdb = resolved.as_bytes();
                     let present = store::bootstrap_all_present(handle, allocator, rdb, tool) catch false;
@@ -672,10 +807,11 @@ pub fn run_status(
                         status_text = "missing";
                     }
                 } else {
+                    let ub = url.as_bytes();
                     let sb = sha.as_bytes();
                     var key = string::new(allocator);
                     defer key.deinit(allocator);
-                    store::format_store_key(allocator, tname, tver, sb, &var key) catch return Error::OutOfMemory;
+                    store::format_tool_store_key(allocator, tool, ub, sb, &var key) catch return Error::OutOfMemory;
                     let kb = key.as_bytes();
                     var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
                     defer entry_dir.deinit(allocator);
@@ -713,10 +849,10 @@ pub fn run_status(
                 var sha = string::new(allocator);
                 defer sha.deinit(allocator);
                 var locked = false;
-                if workspace::resolve_asset_lock(allocator, asset, &lf, os, arch_b, &var url, &var sha) |ok| {
+                if resolve::resolve_asset_lock(allocator, asset, &lf, os, arch_b, &var url, &var sha) |ok| {
                     locked = ok;
                 } else |err| {
-                    return map_ws_err(err);
+                    return map_resolve_err(err);
                 }
 
                 var status_text: []u8 = "unlocked";
@@ -726,10 +862,11 @@ pub fn run_status(
                     status_text = "unlocked";
                     resolved.append_bytes(allocator, "-") catch return Error::OutOfMemory;
                 } else {
+                    let ub = url.as_bytes();
                     let sb = sha.as_bytes();
                     var key = string::new(allocator);
                     defer key.deinit(allocator);
-                    store::format_asset_store_key(allocator, aname, aver, sb, &var key) catch return Error::OutOfMemory;
+                    store::format_asset_store_key(allocator, asset, ub, sb, &var key) catch return Error::OutOfMemory;
                     let kb = key.as_bytes();
                     var entry_dir = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
                     defer entry_dir.deinit(allocator);
@@ -759,6 +896,69 @@ pub fn run_status(
                 ai = ai + 1;
             }
 
+            if m.wrappers.len() > 0 {
+                var tool_paths = map::new<[]u8, string::String>(allocator);
+                defer tool_paths.deinit(allocator);
+                var asset_paths = map::new<[]u8, string::String>(allocator);
+                defer asset_paths.deinit(allocator);
+                if resolve::collect_known_paths(allocator, paths, &m, &lf, manifest_dir, os, arch_b, &var tool_paths, &var asset_paths) {} else |err| {
+                    return map_resolve_err(err);
+                }
+
+                var wi = 0;
+                while m.wrappers.at(wi) |wrapper| {
+                    let wname = wrapper.name.as_bytes();
+                    var script = string::new(allocator);
+                    defer script.deinit(allocator);
+                    var status_text: []u8 = "unlocked";
+                    var resolved = string::new(allocator);
+                    defer resolved.deinit(allocator);
+                    if resolve::render_wrapper_script(allocator, wrapper, home_b, manifest_dir, &tool_paths, &asset_paths, &m, &var script, diag) {
+                        let sb = script.as_bytes();
+                        var wkey = string::new(allocator);
+                        defer wkey.deinit(allocator);
+                        store::format_wrapper_store_key(allocator, wname, sb, &var wkey) catch return Error::OutOfMemory;
+                        let wkb = wkey.as_bytes();
+                        var entry_dir = path::join(allocator, sd, wkb) catch return Error::OutOfMemory;
+                        defer entry_dir.deinit(allocator);
+                        let edb = entry_dir.as_bytes();
+                        resolved.append_bytes(allocator, edb) catch return Error::OutOfMemory;
+                        var bin_dir = path::join(allocator, edb, "bin") catch return Error::OutOfMemory;
+                        defer bin_dir.deinit(allocator);
+                        let bdb = bin_dir.as_bytes();
+                        var bin_file = path::join(allocator, bdb, wname) catch return Error::OutOfMemory;
+                        defer bin_file.deinit(allocator);
+                        let bfb = bin_file.as_bytes();
+                        let kind = posix::inspect_path(handle, allocator, bfb) catch posix::PathKind::Missing;
+                        if kind == posix::PathKind::File {
+                            status_text = "ok";
+                        } else {
+                            status_text = "missing";
+                        }
+                    } else |err| {
+                        if err == resolve::Error::Unlocked {
+                            status_text = "unlocked";
+                            resolved.append_bytes(allocator, "-") catch return Error::OutOfMemory;
+                        } else {
+                            return map_resolve_err(err);
+                        }
+                    }
+
+                    var line = string::new(allocator);
+                    defer line.deinit(allocator);
+                    line.append_bytes(allocator, "wrapper:") catch return Error::OutOfMemory;
+                    line.append_bytes(allocator, wname) catch return Error::OutOfMemory;
+                    line.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+                    line.append_bytes(allocator, status_text) catch return Error::OutOfMemory;
+                    line.append_byte(allocator, cast<u8>(32)) catch return Error::OutOfMemory;
+                    let res_b = resolved.as_bytes();
+                    line.append_bytes(allocator, res_b) catch return Error::OutOfMemory;
+                    let lb = line.as_bytes();
+                    io::write_stdout_line(handle, lb) catch return Error::IoFailed;
+                    wi = wi + 1;
+                }
+            }
+
             let usage = gc::compute_store_usage(handle, allocator, paths) catch return Error::IoFailed;
             var total_line = string::new(allocator);
             defer total_line.deinit(allocator);
@@ -782,7 +982,7 @@ pub fn run_status(
     }
 }
 
-test "env formatting for posix and fish shells" {
+test "env formatting for posix and fish shells with env_prepend and wrappers" {
     let allocator = mem::page_allocator();
     let doc =
         \\[tools.demo]
@@ -809,14 +1009,22 @@ test "env formatting for posix and fish shells" {
         \\version = "1.0.0"
         \\url = "https://example.com/unlocked.tar.gz"
         \\
+        \\[wrappers.my-wrap]
+        \\exec = "{tool.demo}/bin/demo"
+        \\args = ["{asset.fonts}/otf"]
+        \\
         \\[env]
         \\EDITOR = "nvim"
         \\MY_DIR = "~/tools"
         \\PROJ_LIB = "{manifest_dir}/lib/kizu"
         \\MULTI = "{manifest_dir}/a:{manifest_dir}/b"
-        \\COMBO = "~/cache:{manifest_dir}/out:{asset.fonts}/otf:{tool.demo}/lib:{tool.boot}"
         \\ASSET_DIR = "{asset.fonts}"
         \\TOOL_DIR = "{tool.demo}"
+        \\BOOT_DIR = "{tool.boot}"
+        \\
+        \\[env_prepend]
+        \\PKG_CONFIG_PATH = ["{asset.fonts}/lib/pkgconfig", "{manifest_dir}/pc"]
+        \\CPATH = "{asset.fonts}/include"
     ;
     var diag = string::new(allocator);
     defer diag.deinit(allocator);
@@ -833,83 +1041,81 @@ test "env formatting for posix and fish shells" {
         var asset_paths = map::new<[]u8, string::String>(allocator);
         defer asset_paths.deinit(allocator);
 
-        if collect_tool_entries(allocator, &paths, &m, &lf, "/work/proj", "darwin", "aarch64", &var dirs, &var tool_paths, &var diag) {} else |_| {
-            testing::fail("collect_tool_entries failed");
+        if collect_runtime_bin_dirs(allocator, &paths, &m, &lf, "/work/proj", "darwin", "aarch64", &var dirs, &var tool_paths, &var asset_paths, &var diag) {} else |_| {
+            testing::fail("collect_runtime_bin_dirs failed");
             return;
         }
-        if collect_asset_paths(allocator, &paths, &m, &lf, "darwin", "aarch64", &var asset_paths) {} else |_| {
-            testing::fail("collect_asset_paths failed");
-            return;
+
+        if dirs.at(0) |first_dir| {
+            let fdb = first_dir.as_bytes();
+            testing::expect(bytes::contains_bytes(fdb, "/kugi/store/wrap-my-wrap-"));
+        } else {
+            testing::fail("missing wrapper bin dir");
         }
 
         var sh_out = string::new(allocator);
         defer sh_out.deinit(allocator);
-        if format_env_script(allocator, ShellKind::Posix, &dirs, &m, "/test-home", "/work/proj", &tool_paths, &asset_paths, &var sh_out, &var diag) {
+        if format_env_script(allocator, resolve::ShellKind::Posix, &dirs, &m, "/test-home", "/work/proj", &tool_paths, &asset_paths, &var sh_out, &var diag) {
             let sb = sh_out.as_bytes();
-            testing::expect(bytes::contains_bytes(sb, "export PATH='/kugi/store/demo-1.0.0-111111111111/bin:/test-home/boot/bin'"));
+            let exp_pkg =
+                \\export PKG_CONFIG_PATH='/kugi/store/asset-3333333333333333/lib/pkgconfig:/work/proj/pc'${PKG_CONFIG_PATH:+:"$PKG_CONFIG_PATH"}
+            ;
+            let exp_cpath =
+                \\export CPATH='/kugi/store/asset-3333333333333333/include'${CPATH:+:"$CPATH"}
+            ;
             testing::expect(bytes::contains_bytes(sb, "export EDITOR='nvim'"));
             testing::expect(bytes::contains_bytes(sb, "export MY_DIR='/test-home/tools'"));
             testing::expect(bytes::contains_bytes(sb, "export PROJ_LIB='/work/proj/lib/kizu'"));
-            testing::expect(bytes::contains_bytes(sb, "export MULTI='/work/proj/a:/work/proj/b'"));
-            testing::expect(bytes::contains_bytes(sb, "export ASSET_DIR='/kugi/store/asset-fonts-2.0.0-333333333333'"));
-            testing::expect(bytes::contains_bytes(sb, "export TOOL_DIR='/kugi/store/demo-1.0.0-111111111111'"));
-            testing::expect(bytes::contains_bytes(sb, "export COMBO='/test-home/cache:/work/proj/out:/kugi/store/asset-fonts-2.0.0-333333333333/otf:/kugi/store/demo-1.0.0-111111111111/lib:/test-home/boot/bin'"));
+            testing::expect(bytes::contains_bytes(sb, "export ASSET_DIR='/kugi/store/asset-3333333333333333'"));
+            testing::expect(bytes::contains_bytes(sb, "export BOOT_DIR='/test-home/boot/bin'"));
+            testing::expect(bytes::contains_bytes(sb, exp_pkg));
+            testing::expect(bytes::contains_bytes(sb, exp_cpath));
+            testing::expect(bytes::contains_bytes(sb, "export PATH='/kugi/store/wrap-my-wrap-"));
         } else |_| {
             testing::fail("posix format_env_script failed");
         }
 
         var fish_out = string::new(allocator);
         defer fish_out.deinit(allocator);
-        if format_env_script(allocator, ShellKind::Fish, &dirs, &m, "/test-home", "/work/proj", &tool_paths, &asset_paths, &var fish_out, &var diag) {
+        if format_env_script(allocator, resolve::ShellKind::Fish, &dirs, &m, "/test-home", "/work/proj", &tool_paths, &asset_paths, &var fish_out, &var diag) {
             let fb = fish_out.as_bytes();
-            testing::expect(bytes::contains_bytes(fb, "set -gx PATH '/kugi/store/demo-1.0.0-111111111111/bin' '/test-home/boot/bin' $PATH"));
+            let exp_fish_pkg =
+                \\if set -q PKG_CONFIG_PATH; and test -n "$PKG_CONFIG_PATH"; set -gx PKG_CONFIG_PATH '/kugi/store/asset-3333333333333333/lib/pkgconfig:/work/proj/pc:'"$PKG_CONFIG_PATH"; else; set -gx PKG_CONFIG_PATH '/kugi/store/asset-3333333333333333/lib/pkgconfig:/work/proj/pc'; end
+            ;
+            testing::expect(bytes::contains_bytes(fb, "set -gx PATH '/kugi/store/wrap-my-wrap-"));
             testing::expect(bytes::contains_bytes(fb, "set -gx EDITOR 'nvim'"));
-            testing::expect(bytes::contains_bytes(fb, "set -gx ASSET_DIR '/kugi/store/asset-fonts-2.0.0-333333333333'"));
-            testing::expect(bytes::contains_bytes(fb, "set -gx TOOL_DIR '/kugi/store/demo-1.0.0-111111111111'"));
+            testing::expect(bytes::contains_bytes(fb, "set -gx ASSET_DIR '/kugi/store/asset-3333333333333333'"));
+            testing::expect(bytes::contains_bytes(fb, exp_fish_pkg));
         } else |_| {
             testing::fail("fish format_env_script failed");
         }
 
         var bad_out = string::new(allocator);
         defer bad_out.deinit(allocator);
-        if expand_env_value(allocator, "{asset.nonexistent}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
+        if resolve::expand_placeholders(allocator, "{asset.nonexistent}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
             testing::fail("unknown asset reference should fail");
         } else |err| {
-            testing::expect(err == Error::ManifestInvalid);
+            testing::expect(err == resolve::Error::ManifestInvalid);
             let db = diag.as_bytes();
             testing::expect(bytes::contains_bytes(db, "unknown asset 'nonexistent'"));
         }
 
         bad_out.clear();
-        if expand_env_value(allocator, "{tool.nonexistent}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
+        if resolve::expand_placeholders(allocator, "{tool.nonexistent}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
             testing::fail("unknown tool reference should fail");
         } else |err| {
-            testing::expect(err == Error::ManifestInvalid);
+            testing::expect(err == resolve::Error::ManifestInvalid);
             let db = diag.as_bytes();
             testing::expect(bytes::contains_bytes(db, "unknown tool 'nonexistent'"));
         }
 
         bad_out.clear();
-        if expand_env_value(allocator, "{asset.unlocked_pack}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
+        if resolve::expand_placeholders(allocator, "{asset.unlocked_pack}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
             testing::fail("unlocked asset reference should fail");
         } else |err| {
-            testing::expect(err == Error::Unlocked);
+            testing::expect(err == resolve::Error::Unlocked);
             let db = diag.as_bytes();
             testing::expect(bytes::contains_bytes(db, "unlocked_pack"));
-        }
-
-        bad_out.clear();
-        if expand_env_value(allocator, "{asset.}", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
-            testing::fail("empty asset placeholder should fail");
-        } else |err| {
-            testing::expect(err == Error::ManifestInvalid);
-        }
-
-        bad_out.clear();
-        if expand_env_value(allocator, "{tool.unclosed", "/test-home", "/work/proj", &tool_paths, &asset_paths, &m, &var bad_out, &var diag) {
-            testing::fail("unterminated tool placeholder should fail");
-        } else |err| {
-            testing::expect(err == Error::ManifestInvalid);
         }
     } else |_| {
         testing::fail("parse env manifest failed");

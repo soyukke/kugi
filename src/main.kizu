@@ -475,11 +475,15 @@ test "manifest and lockfile integration" {
         testing::expect_equal<i64>(1, lf.version);
         var sk = string::new(allocator);
         defer sk.deinit(allocator);
-        if store::format_store_key(allocator, "demo", "1.0.0", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &var sk) {
-            let skb = sk.as_bytes();
-            testing::expect_equal<[]u8>("demo-1.0.0-0123456789ab", skb);
-        } else |_| {
-            testing::fail("format_store_key failed");
+        if m.tools.at(0) |demo| {
+            if store::format_tool_store_key(allocator, demo, "https://example.com/demo-1.0.0-darwin-aarch64.tar.gz", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", &var sk) {
+                let skb = sk.as_bytes();
+                testing::expect(mem::starts_with(skb, "tool-bin-0123456789abcdef-"));
+            } else |_| {
+                testing::fail("format_tool_store_key failed");
+            }
+        } else {
+            testing::fail("missing demo tool");
         }
     } else |_| {
         testing::fail("manifest parse failed");

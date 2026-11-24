@@ -2,12 +2,14 @@ import kugi::archive;
 import kugi::hash;
 import kugi::manifest;
 import kugi::posix;
+import std::array;
 import std::fmt;
 import std::fs;
 import std::io;
 import std::mem;
 import std::path;
 import std::process;
+import std::sort;
 import std::string;
 import std::testing;
 
@@ -174,34 +176,110 @@ pub fn ensure_layout(
     return;
 }
 
-pub fn format_store_key(
+fn append_sha_prefix(
     allocator: Allocator,
-    name: []u8,
-    version: []u8,
     sha256: []u8,
+    max_len: i64,
     out: &var string::String,
 ) -> mem::Error!void {
-    try out.append_bytes(allocator, name);
-    try out.append_byte(allocator, cast<u8>(45));
-    try out.append_bytes(allocator, version);
-    try out.append_byte(allocator, cast<u8>(45));
     var prefix_len = mem::len(sha256);
-    if prefix_len > 12 {
-        prefix_len = 12;
+    if prefix_len > max_len {
+        prefix_len = max_len;
     }
     try out.append_bytes(allocator, sha256[0..prefix_len]);
     return;
 }
 
-pub fn format_asset_store_key(
+pub fn format_tool_store_key(
     allocator: Allocator,
-    name: []u8,
-    version: []u8,
+    tool: &manifest::ToolSpec,
+    url_hint: []u8,
     sha256: []u8,
     out: &var string::String,
 ) -> mem::Error!void {
-    try out.append_bytes(allocator, "asset-");
-    return format_store_key(allocator, name, version, sha256, out);
+    let kind = archive::detect_archive_kind(url_hint, tool.archive);
+    if tool.extract == manifest::ExtractMode::All and kind == archive::ArchiveKind::Tar {
+        try out.append_bytes(allocator, "tool-all-");
+    } else {
+        try out.append_bytes(allocator, "tool-bin-");
+    }
+    try append_sha_prefix(allocator, sha256, 16, out);
+
+    var bin_specs = array::new<string::String>(allocator);
+    defer bin_specs.deinit(allocator);
+    var bi = 0;
+    while tool.bins.at(bi) |bspec| {
+        var entry = string::new(allocator);
+        errdefer entry.deinit(allocator);
+        if kind == archive::ArchiveKind::RawBinary {
+            let db = bspec.dest.as_bytes();
+            try entry.append_bytes(allocator, db);
+        } else {
+            let sb = bspec.source.as_bytes();
+            let db = bspec.dest.as_bytes();
+            try entry.append_bytes(allocator, sb);
+            try entry.append_byte(allocator, cast<u8>(58));
+            try entry.append_bytes(allocator, db);
+        }
+        try bin_specs.append(allocator, move entry);
+        bi = bi + 1;
+    }
+    sort::strings(&var bin_specs) catch return mem::Error::OutOfMemory;
+
+    var spec_buf = string::new(allocator);
+    defer spec_buf.deinit(allocator);
+    var si = 0;
+    while bin_specs.at(si) |item| {
+        if si > 0 {
+            try spec_buf.append_byte(allocator, cast<u8>(10));
+        }
+        let ib = item.as_bytes();
+        try spec_buf.append_bytes(allocator, ib);
+        si = si + 1;
+    }
+    let spec_bytes = spec_buf.as_bytes();
+    try out.append_byte(allocator, cast<u8>(45));
+    try hash::sha256_hex_prefix(allocator, spec_bytes, 8, out);
+    return;
+}
+
+pub fn format_asset_store_key(
+    allocator: Allocator,
+    asset: &manifest::AssetSpec,
+    url_hint: []u8,
+    sha256: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    let kind = archive::detect_archive_kind(url_hint, asset.archive);
+    if kind == archive::ArchiveKind::RawBinary {
+        try out.append_bytes(allocator, "asset-file-");
+        try append_sha_prefix(allocator, sha256, 16, out);
+        try out.append_byte(allocator, cast<u8>(45));
+        let aname = asset.name.as_bytes();
+        let filename = archive::extract_url_filename(url_hint, aname);
+        try hash::sha256_hex_prefix(allocator, filename, 8, out);
+        return;
+    }
+    if asset.unwrap {
+        try out.append_bytes(allocator, "asset-");
+    } else {
+        try out.append_bytes(allocator, "asset-tree-");
+    }
+    try append_sha_prefix(allocator, sha256, 16, out);
+    return;
+}
+
+pub fn format_wrapper_store_key(
+    allocator: Allocator,
+    name: []u8,
+    script_bytes: []u8,
+    out: &var string::String,
+) -> mem::Error!void {
+    try out.append_bytes(allocator, "wrap-");
+    try out.append_bytes(allocator, name);
+    try out.append_byte(allocator, cast<u8>(45));
+    try hash::sha256_hex_prefix(allocator, script_bytes, 12, out);
+    return;
 }
 
 pub fn format_root_id(
@@ -237,11 +315,9 @@ pub fn publish_verified_file(
     seq: i64,
     out_actual_sha: &var string::String,
 ) -> Error!void {
-    let tname = tool.name.as_bytes();
-    let tver = tool.version.as_bytes();
     var key = string::new(allocator);
     defer key.deinit(allocator);
-    format_store_key(allocator, tname, tver, expected_sha, &var key) catch return Error::OutOfMemory;
+    format_tool_store_key(allocator, tool, url_hint, expected_sha, &var key) catch return Error::OutOfMemory;
     let kb = key.as_bytes();
 
     let sd = paths.store_dir.as_bytes();
@@ -309,11 +385,9 @@ pub fn publish_verified_asset_file(
     seq: i64,
     out_actual_sha: &var string::String,
 ) -> Error!void {
-    let aname = asset.name.as_bytes();
-    let aver = asset.version.as_bytes();
     var key = string::new(allocator);
     defer key.deinit(allocator);
-    format_asset_store_key(allocator, aname, aver, expected_sha, &var key) catch return Error::OutOfMemory;
+    format_asset_store_key(allocator, asset, url_hint, expected_sha, &var key) catch return Error::OutOfMemory;
     let kb = key.as_bytes();
 
     let sd = paths.store_dir.as_bytes();
@@ -496,6 +570,191 @@ pub fn install_bootstrap_file(
     return;
 }
 
+fn publish_wrapper_script_locked(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+    name: []u8,
+    script_bytes: []u8,
+    ftb: []u8,
+    seq: i64,
+) -> Error!void {
+    let existing = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+    if existing == posix::PathKind::Dir {
+        posix::touch_now(allocator, ftb);
+        return;
+    }
+
+    var nonce = string::new(allocator);
+    defer nonce.deinit(allocator);
+    make_nonce(allocator, seq, &var nonce) catch return Error::OutOfMemory;
+    let nb = nonce.as_bytes();
+
+    let td = paths.tmp_dir.as_bytes();
+    var stage_dir = string::new(allocator);
+    defer stage_dir.deinit(allocator);
+    stage_dir.append_bytes(allocator, td) catch return Error::OutOfMemory;
+    stage_dir.append_bytes(allocator, "/wrap-") catch return Error::OutOfMemory;
+    stage_dir.append_bytes(allocator, nb) catch return Error::OutOfMemory;
+    let sdb = stage_dir.as_bytes();
+
+    var stage_bin = path::join(allocator, sdb, "bin") catch return Error::OutOfMemory;
+    defer stage_bin.deinit(allocator);
+    let sbb = stage_bin.as_bytes();
+
+    if posix::create_dir_all(handle, allocator, sbb) {} else |_| {
+        return cleanup_and_io(handle, allocator, sdb);
+    }
+
+    var script_path = path::join(allocator, sbb, name) catch return cleanup_and_oom(handle, allocator, sdb);
+    defer script_path.deinit(allocator);
+    let spb = script_path.as_bytes();
+
+    if posix::write_file_atomic(handle, allocator, spb, script_bytes, nb) {} else |_| {
+        return cleanup_and_io(handle, allocator, sdb);
+    }
+    if posix::set_executable(allocator, spb) {} else |_| {
+        return cleanup_and_io(handle, allocator, sdb);
+    }
+
+    if posix::rename_path(allocator, sdb, ftb) {
+        posix::touch_now(allocator, ftb);
+        return;
+    } else |_| {
+        let _ = posix::remove_tree(handle, allocator, sdb);
+        let after = posix::inspect_path(handle, allocator, ftb) catch return Error::IoFailed;
+        if after == posix::PathKind::Dir {
+            posix::touch_now(allocator, ftb);
+            return;
+        }
+        return Error::IoFailed;
+    }
+}
+
+pub fn publish_wrapper_script(
+    handle: Io,
+    allocator: Allocator,
+    paths: &Paths,
+    name: []u8,
+    script_bytes: []u8,
+    seq: i64,
+    out_key: &var string::String,
+) -> Error!void {
+    out_key.clear();
+    format_wrapper_store_key(allocator, name, script_bytes, out_key) catch return Error::OutOfMemory;
+    let kb = out_key.as_bytes();
+
+    let sd = paths.store_dir.as_bytes();
+    let ld = paths.locks_dir.as_bytes();
+
+    var final_target = path::join(allocator, sd, kb) catch return Error::OutOfMemory;
+    defer final_target.deinit(allocator);
+    let ftb = final_target.as_bytes();
+
+    var lock_name = string::new(allocator);
+    defer lock_name.deinit(allocator);
+    lock_name.append_bytes(allocator, "store-") catch return Error::OutOfMemory;
+    lock_name.append_bytes(allocator, kb) catch return Error::OutOfMemory;
+    lock_name.append_bytes(allocator, ".lock") catch return Error::OutOfMemory;
+    let lnb = lock_name.as_bytes();
+    var lock_file = path::join(allocator, ld, lnb) catch return Error::OutOfMemory;
+    defer lock_file.deinit(allocator);
+    let lfb = lock_file.as_bytes();
+
+    var guard = posix::acquire_exclusive_lock(allocator, lfb) catch return Error::IoFailed;
+    let res = publish_wrapper_script_locked(handle, allocator, paths, name, script_bytes, ftb, seq);
+    posix::release_lock(&var guard);
+    if res {} else |err| {
+        return err;
+    }
+    return;
+}
+
+test "store key deduplication and extract mode isolation" {
+    let allocator = mem::page_allocator();
+    let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let doc =
+        \\[tools.ripgrep]
+        \\version = "14.1.1"
+        \\url = "https://example.com/rg.tar.gz"
+        \\bin = ["rg", "extra"]
+        \\
+        \\[tools.rg_alias]
+        \\version = "14.1.1"
+        \\url = "https://mirror.example.com/rg.tar.gz"
+        \\bin = ["extra", "rg"]
+        \\
+        \\[tools.rg_all]
+        \\version = "14.1.1"
+        \\url = "https://example.com/rg.tar.gz"
+        \\extract = "all"
+        \\bin = ["rg", "extra"]
+        \\
+        \\[assets.pkg_a]
+        \\version = "1.0.0"
+        \\url = "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"
+        \\
+        \\[assets.pkg_b]
+        \\version = "1.0.0"
+        \\url = "https://mirror.example.com/demo-1.0.0.tgz"
+        \\
+        \\[assets.pkg_tree]
+        \\version = "1.0.0"
+        \\url = "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"
+        \\unwrap = false
+    ;
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+    if manifest::parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+        if m.tools.at(0) |t0| {
+            if m.tools.at(1) |t1| {
+                if m.tools.at(2) |t2| {
+                    var k0 = string::new(allocator);
+                    defer k0.deinit(allocator);
+                    var k1 = string::new(allocator);
+                    defer k1.deinit(allocator);
+                    var k2 = string::new(allocator);
+                    defer k2.deinit(allocator);
+                    format_tool_store_key(allocator, t0, "https://example.com/rg.tar.gz", sha, &var k0) catch return;
+                    format_tool_store_key(allocator, t1, "https://mirror.example.com/rg.tar.gz", sha, &var k1) catch return;
+                    format_tool_store_key(allocator, t2, "https://example.com/rg.tar.gz", sha, &var k2) catch return;
+                    let k0b = k0.as_bytes();
+                    let k1b = k1.as_bytes();
+                    let k2b = k2.as_bytes();
+                    testing::expect_equal<[]u8>(k0b, k1b);
+                    testing::expect(mem::starts_with(k0b, "tool-bin-0123456789abcdef-"));
+                    testing::expect(mem::starts_with(k2b, "tool-all-0123456789abcdef-"));
+                    testing::expect(!mem::equal_bytes(k0b, k2b));
+                }
+            }
+        }
+        if m.assets.at(0) |a0| {
+            if m.assets.at(1) |a1| {
+                if m.assets.at(2) |a2| {
+                    var k0 = string::new(allocator);
+                    defer k0.deinit(allocator);
+                    var k1 = string::new(allocator);
+                    defer k1.deinit(allocator);
+                    var k2 = string::new(allocator);
+                    defer k2.deinit(allocator);
+                    format_asset_store_key(allocator, a0, "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz", sha, &var k0) catch return;
+                    format_asset_store_key(allocator, a1, "https://mirror.example.com/demo-1.0.0.tgz", sha, &var k1) catch return;
+                    format_asset_store_key(allocator, a2, "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz", sha, &var k2) catch return;
+                    let k0b = k0.as_bytes();
+                    let k1b = k1.as_bytes();
+                    let k2b = k2.as_bytes();
+                    testing::expect_equal<[]u8>("asset-0123456789abcdef", k0b);
+                    testing::expect_equal<[]u8>(k0b, k1b);
+                    testing::expect_equal<[]u8>("asset-tree-0123456789abcdef", k2b);
+                }
+            }
+        }
+    } else |_| {
+        testing::fail("parse manifest failed");
+    }
+}
+
 test "store hash verification publish and bootstrap no-clobber" {
     let handle = io::blocking();
     let allocator = mem::page_allocator();
@@ -576,7 +835,7 @@ test "store hash verification publish and bootstrap no-clobber" {
             }
             var sk = string::new(allocator);
             defer sk.deinit(allocator);
-            format_store_key(allocator, "demo", "1.0.0", good_sha_b, &var sk) catch return;
+            format_tool_store_key(allocator, demo, "https://example.com/demo", good_sha_b, &var sk) catch return;
             let skb = sk.as_bytes();
             let sd = paths.store_dir.as_bytes();
             var store_entry = path::join(allocator, sd, skb) catch return;
@@ -647,9 +906,9 @@ test "store hash verification publish and bootstrap no-clobber" {
             }
             var ak = string::new(allocator);
             defer ak.deinit(allocator);
-            format_asset_store_key(allocator, "pack", "1.0.0", good_sha_b, &var ak) catch return;
+            format_asset_store_key(allocator, pack, "https://example.com/packs/data.bin", good_sha_b, &var ak) catch return;
             let akb = ak.as_bytes();
-            testing::expect(mem::starts_with(akb, "asset-pack-1.0.0-"));
+            testing::expect(mem::starts_with(akb, "asset-file-"));
             let sd = paths.store_dir.as_bytes();
             var asset_entry = path::join(allocator, sd, akb) catch return;
             defer asset_entry.deinit(allocator);
@@ -662,6 +921,30 @@ test "store hash verification publish and bootstrap no-clobber" {
             } else |_| {
                 testing::fail("published asset data.bin missing");
             }
+        }
+        var wk = string::new(allocator);
+        defer wk.deinit(allocator);
+        let wrap_body =
+            \\#!/bin/sh
+            \\exec echo hi "$@"
+        ;
+        if publish_wrapper_script(handle, allocator, &paths, "my-wrap", wrap_body, 8, &var wk) {
+            let wkb = wk.as_bytes();
+            testing::expect(mem::starts_with(wkb, "wrap-my-wrap-"));
+            let sd = paths.store_dir.as_bytes();
+            var wrap_entry = path::join(allocator, sd, wkb) catch return;
+            defer wrap_entry.deinit(allocator);
+            let web = wrap_entry.as_bytes();
+            var wrap_bin = path::join(allocator, web, "bin/my-wrap") catch return;
+            defer wrap_bin.deinit(allocator);
+            let wbb = wrap_bin.as_bytes();
+            if posix::inspect_path(handle, allocator, wbb) |k| {
+                testing::expect(k == posix::PathKind::File);
+            } else |_| {
+                testing::fail("published wrapper bin missing");
+            }
+        } else |_| {
+            testing::fail("publish_wrapper_script failed");
         }
     } else |_| {
         testing::fail("parse manifest failed");

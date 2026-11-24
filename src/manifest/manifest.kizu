@@ -116,18 +116,54 @@ pub struct StoreConfig {
     pub max_size_bytes: i64,
 }
 
+pub struct EnvPrependSpec {
+    pub key: string::String,
+    pub values: array::Array<string::String>,
+}
+
+pub fn (self: EnvPrependSpec) deinit(allocator: Allocator) -> void {
+    self.key.deinit(allocator);
+    self.values.deinit(allocator);
+    return;
+}
+
+pub struct WrapperSpec {
+    pub name: string::String,
+    pub has_exec: bool,
+    pub exec: string::String,
+    pub has_args: bool,
+    pub args: array::Array<string::String>,
+    pub has_env: bool,
+    pub env: map::Map<[]u8, string::String>,
+    pub has_env_prepend: bool,
+    pub env_prepend: map::Map<[]u8, string::String>,
+}
+
+pub fn (self: WrapperSpec) deinit(allocator: Allocator) -> void {
+    self.name.deinit(allocator);
+    self.exec.deinit(allocator);
+    self.args.deinit(allocator);
+    self.env.deinit(allocator);
+    self.env_prepend.deinit(allocator);
+    return;
+}
+
 pub struct Manifest {
     pub store: StoreConfig,
     pub tools: array::Array<ToolSpec>,
     pub assets: array::Array<AssetSpec>,
+    pub wrappers: array::Array<WrapperSpec>,
     pub env: map::Map<[]u8, string::String>,
+    pub env_prepend: array::Array<EnvPrependSpec>,
     pub links: map::Map<[]u8, string::String>,
 }
 
 pub fn (self: Manifest) deinit(allocator: Allocator) -> void {
     self.tools.deinit(allocator);
     self.assets.deinit(allocator);
+    self.wrappers.deinit(allocator);
     self.env.deinit(allocator);
+    self.env_prepend.deinit(allocator);
     self.links.deinit(allocator);
     return;
 }
@@ -137,7 +173,9 @@ enum SectionKind {
     Store,
     Tool,
     Asset,
+    Wrapper,
     Env,
+    EnvPrepend,
     Links,
 }
 
@@ -196,6 +234,22 @@ fn new_asset_spec(allocator: Allocator, name: []u8) -> Error!AssetSpec {
         has_unwrap: false,
         has_sha256: false,
         sha256: string::new(allocator),
+    };
+}
+
+fn new_wrapper_spec(allocator: Allocator, name: []u8) -> Error!WrapperSpec {
+    var owned_name = string::from_bytes(allocator, name) catch return Error::OutOfMemory;
+    errdefer owned_name.deinit(allocator);
+    return WrapperSpec {
+        name: move owned_name,
+        has_exec: false,
+        exec: string::new(allocator),
+        has_args: false,
+        args: array::new<string::String>(allocator),
+        has_env: false,
+        env: map::new<[]u8, string::String>(allocator),
+        has_env_prepend: false,
+        env_prepend: map::new<[]u8, string::String>(allocator),
     };
 }
 
@@ -598,6 +652,57 @@ fn has_asset_named(assets: &array::Array<AssetSpec>, name: []u8) -> bool {
     return false;
 }
 
+fn has_wrapper_named(wrappers: &array::Array<WrapperSpec>, name: []u8) -> bool {
+    var i = 0;
+    while wrappers.at(i) |w| {
+        let wname = w.name.as_bytes();
+        if mem::equal_bytes(wname, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn has_env_prepend_key(items: &array::Array<EnvPrependSpec>, key: []u8) -> bool {
+    var i = 0;
+    while items.at(i) |item| {
+        let kb = item.key.as_bytes();
+        if mem::equal_bytes(kb, key) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn valid_env_key(key: []u8) -> bool {
+    let length = mem::len(key);
+    if length == 0 {
+        return false;
+    }
+    let first = key[0];
+    let first_ok = (first >= cast<u8>(65) and first <= cast<u8>(90))
+        or (first >= cast<u8>(97) and first <= cast<u8>(122))
+        or first == cast<u8>(95);
+    if !first_ok {
+        return false;
+    }
+    var i = 1;
+    while i < length {
+        let b = key[i];
+        let ok = (b >= cast<u8>(65) and b <= cast<u8>(90))
+            or (b >= cast<u8>(97) and b <= cast<u8>(122))
+            or (b >= cast<u8>(48) and b <= cast<u8>(57))
+            or b == cast<u8>(95);
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 fn parse_bool(
     allocator: Allocator,
     cur: &var Cursor,
@@ -736,6 +841,44 @@ fn validate_tool(
     return;
 }
 
+fn validate_wrapper(
+    allocator: Allocator,
+    wrapper: &WrapperSpec,
+    diag: &var string::String,
+) -> Error!void {
+    if !wrapper.has_exec or wrapper.exec.len() == 0 {
+        set_diag(allocator, diag, 0, "wrapper is missing required field 'exec'");
+        return Error::Validation;
+    }
+    var ei = 0;
+    while wrapper.env.key_at(ei) |k| {
+        if !valid_env_key(k) {
+            set_diag(allocator, diag, 0, "invalid environment variable name in wrapper 'env'");
+            return Error::Validation;
+        }
+        ei = ei + 1;
+    }
+    var pi = 0;
+    while wrapper.env_prepend.key_at(pi) |k| {
+        if !valid_env_key(k) {
+            set_diag(allocator, diag, 0, "invalid environment variable name in wrapper 'env_prepend'");
+            return Error::Validation;
+        }
+        if wrapper.env.contains(k) {
+            set_diag(allocator, diag, 0, "environment variable cannot appear in both wrapper 'env' and 'env_prepend'");
+            return Error::Validation;
+        }
+        if wrapper.env_prepend.at(k) |v| {
+            if v.len() == 0 {
+                set_diag(allocator, diag, 0, "wrapper 'env_prepend' value must not be empty");
+                return Error::Validation;
+            }
+        }
+        pi = pi + 1;
+    }
+    return;
+}
+
 fn parse_section_header(
     allocator: Allocator,
     cur: &var Cursor,
@@ -743,8 +886,10 @@ fn parse_section_header(
     section: &var SectionKind,
     current_tool: &var i64,
     current_asset: &var i64,
+    current_wrapper: &var i64,
     seen_store: &var bool,
     seen_env: &var bool,
+    seen_env_prepend: &var bool,
     seen_links: &var bool,
     diag: &var string::String,
 ) -> Error!void {
@@ -773,6 +918,7 @@ fn parse_section_header(
         section.* = SectionKind::Store;
         current_tool.* = -1;
         current_asset.* = -1;
+        current_wrapper.* = -1;
         try skip_line_tail(allocator, cur, diag);
         return;
     }
@@ -794,6 +940,29 @@ fn parse_section_header(
         section.* = SectionKind::Env;
         current_tool.* = -1;
         current_asset.* = -1;
+        current_wrapper.* = -1;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "env_prepend") {
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after [env_prepend");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after [env_prepend");
+            return Error::Syntax;
+        }
+        if seen_env_prepend.* {
+            set_diag(allocator, diag, cur.line, "duplicate [env_prepend] section");
+            return Error::Validation;
+        }
+        seen_env_prepend.* = true;
+        section.* = SectionKind::EnvPrepend;
+        current_tool.* = -1;
+        current_asset.* = -1;
+        current_wrapper.* = -1;
         try skip_line_tail(allocator, cur, diag);
         return;
     }
@@ -815,6 +984,7 @@ fn parse_section_header(
         section.* = SectionKind::Links;
         current_tool.* = -1;
         current_asset.* = -1;
+        current_wrapper.* = -1;
         try skip_line_tail(allocator, cur, diag);
         return;
     }
@@ -876,6 +1046,7 @@ fn parse_section_header(
         manifest.tools.append(allocator, move spec) catch return Error::OutOfMemory;
         current_tool.* = manifest.tools.len() - 1;
         current_asset.* = -1;
+        current_wrapper.* = -1;
         section.* = SectionKind::Tool;
         try skip_line_tail(allocator, cur, diag);
         return;
@@ -938,7 +1109,71 @@ fn parse_section_header(
         manifest.assets.append(allocator, move spec) catch return Error::OutOfMemory;
         current_asset.* = manifest.assets.len() - 1;
         current_tool.* = -1;
+        current_wrapper.* = -1;
         section.* = SectionKind::Asset;
+        try skip_line_tail(allocator, cur, diag);
+        return;
+    }
+    if mem::equal_bytes(head_bytes, "wrappers") {
+        if advance(cur) |dot| {
+            if dot != cast<u8>(46) {
+                set_diag(allocator, diag, cur.line, "expected '.' in [wrappers.<name>]");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected '.' in [wrappers.<name>]");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        var wname = string::new(allocator);
+        defer wname.deinit(allocator);
+        if peek(cur) |b| {
+            if b == cast<u8>(34) {
+                try parse_quoted_string(allocator, cur, &var wname, diag);
+            } else {
+                let start = cur.pos;
+                while peek(cur) |ch| {
+                    if is_tool_name_byte(ch) {
+                        let _ = advance(cur);
+                    } else {
+                        break;
+                    }
+                }
+                if cur.pos == start {
+                    set_diag(allocator, diag, cur.line, "expected wrapper name after [wrappers.");
+                    return Error::Syntax;
+                }
+                wname.append_bytes(allocator, cur.input[start..cur.pos]) catch return Error::OutOfMemory;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected wrapper name after [wrappers.");
+            return Error::Syntax;
+        }
+        skip_hspace(cur);
+        if advance(cur) |close| {
+            if close != cast<u8>(93) {
+                set_diag(allocator, diag, cur.line, "expected ']' after wrapper name");
+                return Error::Syntax;
+            }
+        } else {
+            set_diag(allocator, diag, cur.line, "expected ']' after wrapper name");
+            return Error::Syntax;
+        }
+        let name_bytes = wname.as_bytes();
+        if !valid_tool_name(name_bytes) {
+            set_diag(allocator, diag, cur.line, "invalid wrapper name");
+            return Error::Validation;
+        }
+        if has_wrapper_named(&manifest.wrappers, name_bytes) {
+            set_diag(allocator, diag, cur.line, "duplicate wrapper section");
+            return Error::Validation;
+        }
+        let spec = try new_wrapper_spec(allocator, name_bytes);
+        manifest.wrappers.append(allocator, move spec) catch return Error::OutOfMemory;
+        current_wrapper.* = manifest.wrappers.len() - 1;
+        current_tool.* = -1;
+        current_asset.* = -1;
+        section.* = SectionKind::Wrapper;
         try skip_line_tail(allocator, cur, diag);
         return;
     }
@@ -1210,6 +1445,55 @@ fn parse_asset_field(
     return Error::Validation;
 }
 
+fn parse_wrapper_field(
+    allocator: Allocator,
+    cur: &var Cursor,
+    key_str: &string::String,
+    wrapper: &var WrapperSpec,
+    diag: &var string::String,
+) -> Error!void {
+    let key = key_str.as_bytes();
+    let field_line = cur.line;
+    if mem::equal_bytes(key, "exec") {
+        if wrapper.has_exec {
+            set_diag(allocator, diag, field_line, "duplicate 'exec' field");
+            return Error::Validation;
+        }
+        try parse_quoted_string(allocator, cur, &var wrapper.exec, diag);
+        wrapper.has_exec = true;
+        return;
+    }
+    if mem::equal_bytes(key, "args") {
+        if wrapper.has_args {
+            set_diag(allocator, diag, field_line, "duplicate 'args' field");
+            return Error::Validation;
+        }
+        try parse_string_array(allocator, cur, &var wrapper.args, diag);
+        wrapper.has_args = true;
+        return;
+    }
+    if mem::equal_bytes(key, "env") {
+        if wrapper.has_env {
+            set_diag(allocator, diag, field_line, "duplicate 'env' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var wrapper.env, diag);
+        wrapper.has_env = true;
+        return;
+    }
+    if mem::equal_bytes(key, "env_prepend") {
+        if wrapper.has_env_prepend {
+            set_diag(allocator, diag, field_line, "duplicate 'env_prepend' field");
+            return Error::Validation;
+        }
+        try parse_inline_map(allocator, cur, &var wrapper.env_prepend, diag);
+        wrapper.has_env_prepend = true;
+        return;
+    }
+    set_diag(allocator, diag, field_line, "unknown field in [wrappers.<name>]");
+    return Error::Validation;
+}
+
 pub fn parse(
     allocator: Allocator,
     input: []u8,
@@ -1222,7 +1506,9 @@ pub fn parse(
         },
         tools: array::new<ToolSpec>(allocator),
         assets: array::new<AssetSpec>(allocator),
+        wrappers: array::new<WrapperSpec>(allocator),
         env: map::new<[]u8, string::String>(allocator),
+        env_prepend: array::new<EnvPrependSpec>(allocator),
         links: map::new<[]u8, string::String>(allocator),
     };
     errdefer manifest.deinit(allocator);
@@ -1231,8 +1517,10 @@ pub fn parse(
     var section = SectionKind::None;
     var current_tool: i64 = -1;
     var current_asset: i64 = -1;
+    var current_wrapper: i64 = -1;
     var seen_store = false;
     var seen_env = false;
+    var seen_env_prepend = false;
     var seen_links = false;
 
     while true {
@@ -1246,8 +1534,10 @@ pub fn parse(
                 &var section,
                 &var current_tool,
                 &var current_asset,
+                &var current_wrapper,
                 &var seen_store,
                 &var seen_env,
+                &var seen_env_prepend,
                 &var seen_links,
                 diag,
             );
@@ -1325,14 +1615,72 @@ pub fn parse(
             }
             try skip_line_tail(allocator, &var cur, diag);
         } else if section == SectionKind::Env {
+            if !valid_env_key(key_bytes) {
+                set_diag(allocator, diag, cur.line, "invalid environment variable name in [env]");
+                return Error::Validation;
+            }
             if manifest.env.contains(key_bytes) {
                 set_diag(allocator, diag, cur.line, "duplicate key in [env]");
+                return Error::Validation;
+            }
+            if has_env_prepend_key(&manifest.env_prepend, key_bytes) {
+                set_diag(allocator, diag, cur.line, "environment variable cannot appear in both [env] and [env_prepend]");
                 return Error::Validation;
             }
             var val = string::new(allocator);
             errdefer val.deinit(allocator);
             try parse_quoted_string(allocator, &var cur, &var val, diag);
             manifest.env.insert(allocator, key_bytes, move val) catch return Error::OutOfMemory;
+            try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::EnvPrepend {
+            if !valid_env_key(key_bytes) {
+                set_diag(allocator, diag, cur.line, "invalid environment variable name in [env_prepend]");
+                return Error::Validation;
+            }
+            if has_env_prepend_key(&manifest.env_prepend, key_bytes) {
+                set_diag(allocator, diag, cur.line, "duplicate key in [env_prepend]");
+                return Error::Validation;
+            }
+            if manifest.env.contains(key_bytes) {
+                set_diag(allocator, diag, cur.line, "environment variable cannot appear in both [env] and [env_prepend]");
+                return Error::Validation;
+            }
+            var values = array::new<string::String>(allocator);
+            errdefer values.deinit(allocator);
+            if peek(&cur) |vb| {
+                if vb == cast<u8>(91) {
+                    try parse_string_array(allocator, &var cur, &var values, diag);
+                } else {
+                    var single = string::new(allocator);
+                    errdefer single.deinit(allocator);
+                    try parse_quoted_string(allocator, &var cur, &var single, diag);
+                    values.append(allocator, move single) catch return Error::OutOfMemory;
+                }
+            } else {
+                set_diag(allocator, diag, cur.line, "expected string or string array in [env_prepend]");
+                return Error::Syntax;
+            }
+            if values.len() == 0 {
+                set_diag(allocator, diag, cur.line, "[env_prepend] entry must not be empty");
+                return Error::Validation;
+            }
+            var has_empty = false;
+            var vi = 0;
+            while values.at(vi) |item| {
+                if item.len() == 0 {
+                    has_empty = true;
+                    break;
+                }
+                vi = vi + 1;
+            }
+            if has_empty {
+                set_diag(allocator, diag, cur.line, "[env_prepend] entry value must not be empty");
+                return Error::Validation;
+            }
+            var owned_key = string::from_bytes(allocator, key_bytes) catch return Error::OutOfMemory;
+            errdefer owned_key.deinit(allocator);
+            let spec = EnvPrependSpec { key: move owned_key, values: move values };
+            manifest.env_prepend.append(allocator, move spec) catch return Error::OutOfMemory;
             try skip_line_tail(allocator, &var cur, diag);
         } else if section == SectionKind::Links {
             if mem::len(key_bytes) == 0 {
@@ -1368,6 +1716,14 @@ pub fn parse(
                 return Error::Syntax;
             }
             try skip_line_tail(allocator, &var cur, diag);
+        } else if section == SectionKind::Wrapper {
+            if manifest.wrappers.at_mut(current_wrapper) |wrapper| {
+                try parse_wrapper_field(allocator, &var cur, &key, wrapper, diag);
+            } else {
+                set_diag(allocator, diag, cur.line, "internal wrapper section error");
+                return Error::Syntax;
+            }
+            try skip_line_tail(allocator, &var cur, diag);
         }
     }
 
@@ -1381,6 +1737,12 @@ pub fn parse(
     while manifest.assets.at(aidx) |asset| {
         try validate_asset(allocator, asset, diag);
         aidx = aidx + 1;
+    }
+
+    var widx = 0;
+    while manifest.wrappers.at(widx) |wrapper| {
+        try validate_wrapper(allocator, wrapper, diag);
+        widx = widx + 1;
     }
 
     return move manifest;
@@ -1553,6 +1915,18 @@ pub fn find_asset_index(manifest: &Manifest, name: []u8) -> ?i64 {
     while manifest.assets.at(i) |asset| {
         let an = asset.name.as_bytes();
         if mem::equal_bytes(an, name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+pub fn find_wrapper_index(manifest: &Manifest, name: []u8) -> ?i64 {
+    var i = 0;
+    while manifest.wrappers.at(i) |wrapper| {
+        let wn = wrapper.name.as_bytes();
+        if mem::equal_bytes(wn, name) {
             return i;
         }
         i = i + 1;
@@ -1897,5 +2271,106 @@ test "parse assets sections and validate rejections" {
     if parse(allocator, latest_asset, &var diag) |bad| {
         bad.deinit(allocator);
         testing::fail("latest version in asset must be rejected");
+    } else |_| {}
+}
+
+test "parse wrappers and env_prepend sections and validate rejections" {
+    let allocator = mem::page_allocator();
+    var diag = string::new(allocator);
+    defer diag.deinit(allocator);
+
+    let doc =
+        \\[wrappers.my-cli]
+        \\exec = "{tool.node}/bin/node"
+        \\args = ["{asset.cli}/dist/cli.js", "--strict"]
+        \\env = { NODE_ENV = "production" }
+        \\env_prepend = { NODE_PATH = "{asset.cli}/node_modules" }
+        \\
+        \\[env]
+        \\FOO = "bar"
+        \\
+        \\[env_prepend]
+        \\PKG_CONFIG_PATH = [
+        \\  "{asset.a}/lib/pkgconfig",
+        \\  "{asset.b}/lib/pkgconfig",
+        \\]
+        \\CPATH = "{asset.a}/include"
+    ;
+    if parse(allocator, doc, &var diag) |m| {
+        defer m.deinit(allocator);
+        testing::expect_equal<i64>(1, m.wrappers.len());
+        testing::expect_equal<i64>(2, m.env_prepend.len());
+        if find_wrapper_index(&m, "my-cli") |wi| {
+            testing::expect_equal<i64>(0, wi);
+        } else {
+            testing::fail("find_wrapper_index failed");
+        }
+        if m.wrappers.at(0) |w| {
+            let ex = w.exec.as_bytes();
+            testing::expect_equal<[]u8>("{tool.node}/bin/node", ex);
+            testing::expect_equal<i64>(2, w.args.len());
+            testing::expect(w.env.contains("NODE_ENV"));
+            testing::expect(w.env_prepend.contains("NODE_PATH"));
+        } else {
+            testing::fail("missing wrapper");
+        }
+        if m.env_prepend.at(0) |ep| {
+            let kb = ep.key.as_bytes();
+            testing::expect_equal<[]u8>("PKG_CONFIG_PATH", kb);
+            testing::expect_equal<i64>(2, ep.values.len());
+        } else {
+            testing::fail("missing env_prepend 0");
+        }
+        if m.env_prepend.at(1) |ep| {
+            let kb = ep.key.as_bytes();
+            testing::expect_equal<[]u8>("CPATH", kb);
+            testing::expect_equal<i64>(1, ep.values.len());
+        } else {
+            testing::fail("missing env_prepend 1");
+        }
+    } else |_| {
+        let msg = diag.as_bytes();
+        testing::fail(msg);
+    }
+
+    let missing_exec =
+        \\[wrappers.broken]
+        \\args = ["--help"]
+    ;
+    if parse(allocator, missing_exec, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("wrapper without exec must be rejected");
+    } else |_| {}
+
+    let overlap_env =
+        \\[env]
+        \\PKG_CONFIG_PATH = "/a"
+        \\
+        \\[env_prepend]
+        \\PKG_CONFIG_PATH = "/b"
+    ;
+    if parse(allocator, overlap_env, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("overlapping [env] and [env_prepend] key must be rejected");
+    } else |_| {}
+
+    let wrapper_overlap =
+        \\[wrappers.dup]
+        \\exec = "sh"
+        \\env = { FOO = "1" }
+        \\env_prepend = { FOO = "2" }
+    ;
+    if parse(allocator, wrapper_overlap, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("overlapping wrapper env and env_prepend must be rejected");
+    } else |_| {}
+
+    let bad_env_name =
+        \\[env]
+        \\"BAD-NAME" = "1"
+    ;
+    if parse(allocator, bad_env_name, &var diag) |bad| {
+        bad.deinit(allocator);
+        testing::fail("invalid env variable name must be rejected");
     } else |_| {}
 }
