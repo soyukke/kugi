@@ -54,6 +54,9 @@ for p in text_files:
             errors.append(f"{p}:{idx}: trailing whitespace")
         if p.as_posix() not in ("scripts/lint.sh", ".github/workflows/ci.yml") and abs_home_re.search(line):
             errors.append(f"{p}:{idx}: hardcoded local host path found")
+    if p.parts[:2] == (".github", "workflows") and p.suffix in (".yml", ".yaml"):
+        if re.search(r"\bgh\s+release\b", text) and "--repo" not in text and "GH_REPO" not in text:
+            errors.append(f"{p}: gh release command must pass --repo or set GH_REPO")
 
 if errors:
     for e in errors:

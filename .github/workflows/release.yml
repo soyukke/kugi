@@ -115,5 +115,7 @@ jobs:
           sha256sum kugi-*.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release create "${GITHUB_REF_NAME}" kugi-*.tar.gz SHA256SUMS.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
